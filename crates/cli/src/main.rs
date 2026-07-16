@@ -1,111 +1,52 @@
-//! CLI wiring for `core` contracts and parser/index/export/ui adapters.
-
-use std::{
-    collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::{self, BufRead, Write},
-    path::{Path, PathBuf},
-    process::Command as ShellCommand,
-    str::FromStr,
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+#![forbid(unsafe_code)]
 
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use pst_pst_pst_core::{
-    AttachmentId,
-    Command as CoreCommand,
-    CommandExecutor,
-    CommandPayload,
-    CommandResult,
-    ContainerFormat,
-    CoreError,
-    CoreResult,
-    ErrorClass,
-    ExecutionContext,
-    ExportFormat,
-    FilterField,
-    Folder,
-    FolderId,
-    FolderListResult,
-    InfoCommand,
-    IndexCommand,
-    IndexPolicy,
-    IndexResult,
-    Mailbox,
-    MailboxId,
-    MailboxState,
-    Message,
-    MessageId,
-    MessageListResult,
-    MessagesCommand,
-    MatchSource,
-    OutputFormat,
-    ParseEvent,
-    ParseEventId,
-    ParseStage,
-    PageInfo,
-    RuntimeExecutionConfig,
-    SearchCommand,
-    SearchFilter,
-    SearchHit,
-    SearchMode,
-    SharedCommandOptions,
-    Severity,
-    ValidationResult,
-    ValidateCommand,
-    WatchCommand,
-    WatchResult,
-    ExportResult as CoreExportResult,
-    UiCommand as CoreUiCommand,
+    AttachmentId, Command as CoreCommand, CommandPayload, CoreError, CoreResult, ContainerFormat, ErrorClass,
+    ExecutionContext, ExportFormat as CoreExportFormat, FilterField, Folder, FolderId, FolderListResult, InfoCommand,
+    IndexCommand, IndexPolicy, IndexResult, Mailbox, MailboxId, MailboxState, Message, MessageId,
+    MessageListResult, MatchSource, OutputFormat, ParseEvent, ParseEventId, ParseStage, PageInfo,
+    PaginationToken, RuntimeExecutionConfig, SearchCommand, SearchFilter, SearchHit, SearchMode, Severity,
+    SharedCommandOptions, ValidateCommand, ValidationResult, WatchCommand, WatchResult,
+    ExportResult as CoreExportResult, ExportCommand, CommandResult, UiCommand as CoreUiCommand, UiResult,
 };
 use pst_pst_pst_export::{
-    progress_channel, ExportConfig, ExportFormat as ExportRuntimeFormat, ExportManifest, InMemoryCheckpointStore,
+    progress_channel, ExportConfig, ExportFormat as RuntimeExportFormat, InMemoryCheckpointStore,
     MockExportEngine,
 };
 use pst_pst_pst_index::{
-    IndexBuildRequest, IndexBuildState, IndexEngine, IndexMatch, IndexMatchMetadata, IndexQuery,
-    IndexQueryResult, IndexReader, IndexSegment, IndexWriter,
+    FilterField as IndexFilterField, IndexBuildRequest, IndexBuildState, IndexMatch, IndexMatchMetadata,
+    IndexQuery, IndexQueryResult, IndexSegment, SearchMode as IndexSearchMode,
 };
-use pst_pst_pst_parser::{
-    DiscoveryReport, ParserConfig, ParserError, ParserRegistry, ParsedStore,
-};
+use pst_pst_pst_parser::{DiscoveryReport, ParserConfig, ParserError, ParserRegistry, ParsedStore};
 use pst_pst_pst_ui::{
     TerminalUi, UiCommand as UiShellCommand, UiCommandBus, UiCommandKind, UiCommandResult, UiConfig,
     UiEvent, UiMode, UiOutput, UiPayload, UiRuntime,
 };
 use serde_json::{to_string, to_string_pretty};
+use std::{cmp::Ordering, collections::{HashMap, HashSet}, io::{self, BufRead, Write}, path::{Path, PathBuf}, process::Command as ShellCommand, str::FromStr, sync::{Arc, Mutex}, thread, time::{SystemTime, UNIX_EPOCH}};
 
 #[derive(Debug, Parser)]
 #[command(name = "pst-pst-pst")]
-#[command(about = "Rust-native parser/index/export/watch/ui CLI")]
+#[command(about = "Rust-native mailbox CLI with parser/index/export/search/watch/ui glue")]
 struct Cli {
-    #[arg(long, default_value_t = 4)]
-    jobs: usize,
-
-    #[arg(long, default_value_t = 4)]
-    io_jobs: usize,
-
-    #[arg(long, default_value_t = 4)]
-    cpu_jobs: usize,
-
+    #[arg(long)]
+    jobs: Option<usize>,
+    #[arg(long)]
+    io_jobs: Option<usize>,
+    #[arg(long)]
+    cpu_jobs: Option<usize>,
     #[arg(long)]
     single_thread: bool,
-
     #[arg(long)]
     deterministic: bool,
-
     #[arg(long)]
     strict: bool,
-
-    #[arg(long, value_enum, default_value_t = OutputArg::Table)]
-    output: OutputArg,
-
     #[arg(long, value_enum)]
     container: Option<ContainerArg>,
-
+    #[arg(long, value_enum, default_value_t = OutputArg::Table)]
+    output: OutputArg,
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -196,13 +137,13 @@ enum ExportFormatArg {
 }
 
 impl ExportFormatArg {
-    fn into_core(self) -> ExportFormat {
+    fn into_core(self) -> CoreExportFormat {
         match self {
-            Self::Eml => ExportFormat::Eml,
-            Self::Mbox => ExportFormat::Mbox,
-            Self::Json => ExportFormat::Json,
-            Self::Jsonl => ExportFormat::Jsonl,
-            Self::Msg => ExportFormat::Msg,
+            Self::Eml => CoreExportFormat::Eml,
+            Self::Mbox => CoreExportFormat::Mbox,
+            Self::Json => CoreExportFormat::Json,
+            Self::Jsonl => CoreExportFormat::Jsonl,
+            Self::Msg => CoreExportFormat::Msg,
         }
     }
 }
@@ -211,31 +152,25 @@ impl ExportFormatArg {
 struct SharedOptions {
     #[arg(long)]
     filter: Vec<String>,
-
     #[arg(long)]
     output: Option<OutputArg>,
-
     #[arg(long)]
     limit: Option<u64>,
-
     #[arg(long)]
     sort: Option<String>,
-
     #[arg(long)]
     deterministic: bool,
-
     #[arg(long)]
     strict: bool,
-
     #[arg(long)]
     page_token: Option<String>,
 }
 
 impl SharedOptions {
-    fn to_core(self, _global_output: OutputFormat) -> SharedCommandOptions {
+    fn into_core(self, global: OutputFormat) -> SharedCommandOptions {
         SharedCommandOptions {
             filter: self.filter,
-            output: self.output.map_or(OutputFormat::Table, OutputArg::into_core),
+            output: self.output.map_or(global, OutputArg::into_core),
             limit: self.limit,
             sort: self.sort,
             deterministic: self.deterministic,
@@ -283,17 +218,6 @@ enum CliCommand {
         #[command(flatten)]
         options: SharedOptions,
     },
-    Extract {
-        source: PathBuf,
-        #[arg(long)]
-        message_id: Option<String>,
-        #[arg(long)]
-        attachment_id: Option<String>,
-        #[arg(short = 'o', long)]
-        out: PathBuf,
-        #[command(flatten)]
-        options: SharedOptions,
-    },
     Export {
         source: PathBuf,
         #[arg(short = 'f', long, value_enum, default_value_t = ExportFormatArg::Jsonl)]
@@ -304,6 +228,17 @@ enum CliCommand {
         folder: Option<String>,
         #[arg(long)]
         message_ids: Vec<String>,
+        #[command(flatten)]
+        options: SharedOptions,
+    },
+    Extract {
+        source: PathBuf,
+        #[arg(long)]
+        message_id: Option<String>,
+        #[arg(long)]
+        attachment_id: Option<String>,
+        #[arg(short = 'o', long)]
+        out: PathBuf,
         #[command(flatten)]
         options: SharedOptions,
     },
@@ -333,14 +268,14 @@ enum CliCommand {
         options: SharedOptions,
     },
     Ui {
-        #[arg(long, default_value = "127.0.0.1:8080")]
+        #[arg(long)]
         bind: String,
         #[command(flatten)]
         options: SharedOptions,
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct GlobalContext {
     output: OutputFormat,
     runtime: RuntimeExecutionConfig,
@@ -351,26 +286,27 @@ struct GlobalContext {
 
 impl GlobalContext {
     fn from_cli(cli: &Cli) -> CoreResult<Self> {
+        let parallelism = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(4);
         let runtime = RuntimeExecutionConfig {
-            jobs: cli.jobs.max(1),
-            io_jobs: cli.io_jobs.max(1),
-            cpu_jobs: cli.cpu_jobs.max(1),
+            jobs: cli.jobs.unwrap_or(parallelism),
+            io_jobs: cli.io_jobs.unwrap_or(parallelism),
+            cpu_jobs: cli.cpu_jobs.unwrap_or(parallelism),
             single_thread: cli.single_thread,
             strict: cli.strict,
-            include_unindexed: false,
+            include_unindexed: true,
             index_staleness_threshold: None,
         };
-        runtime.validate().map_err(|error| CoreError::invalid_input(error.to_string()))?;
-
+        runtime
+            .validate()
+            .map_err(|error| CoreError::invalid_input(error.to_string()))?;
         Ok(Self {
             output: cli.output.into_core(),
             runtime: runtime.normalize(),
             deterministic: cli.deterministic,
             strict: cli.strict,
-            requested_container: cli
-                .container
-                .unwrap_or(ContainerArg::Auto)
-                .into_core(),
+            requested_container: cli.container.clone().unwrap_or(ContainerArg::Auto).into_core(),
         })
     }
 
@@ -386,7 +322,7 @@ impl GlobalContext {
 
 #[derive(Clone)]
 struct CliExecutor {
-    parser: ParserRegistry,
+    parser: Arc<ParserRegistry>,
     index: Arc<Mutex<CliIndex>>,
     export_engine: MockExportEngine,
     checkpoint_store: InMemoryCheckpointStore,
@@ -396,7 +332,7 @@ struct CliExecutor {
 impl CliExecutor {
     fn new(context: &GlobalContext) -> Self {
         Self {
-            parser: ParserRegistry::new(),
+            parser: Arc::new(ParserRegistry::new()),
             index: Arc::new(Mutex::new(CliIndex::default())),
             export_engine: MockExportEngine::default(),
             checkpoint_store: InMemoryCheckpointStore::default(),
@@ -404,74 +340,60 @@ impl CliExecutor {
         }
     }
 
-    fn parse_store(&self, source: &Path, strict: bool, deterministic: bool) -> CoreResult<ParsedStore> {
+    fn parse_store(
+        &self,
+        source: &Path,
+        options: &SharedCommandOptions,
+        context: &ExecutionContext,
+    ) -> CoreResult<ParsedStore> {
+        let strict = options.strict || context.strict;
         let config = ParserConfig {
             source_path: source.to_path_buf(),
             requested_container: self.requested_container,
             strict,
-            allow_fallback: true,
-            deterministic,
+            allow_fallback: !strict,
+            deterministic: options.deterministic || context.deterministic,
             max_bytes: None,
         };
-
         let discovery = self
             .parser
             .discover(&config)
-            .map_err(|error| map_parser_error(error))?;
+            .map_err(map_parser_error)?;
         match self.parser.parse(&config) {
-            Ok(store) => Ok(store),
-            Err(error) if !strict => Ok(self.scaffolded_store(source, &discovery)),
-            Err(error) => Err(map_parser_error(error)),
+            Ok(parsed) => Ok(parsed),
+            Err(error) => {
+                if strict {
+                    Err(map_parser_error(error))
+                } else {
+                    Ok(self.scaffolded_store(source, &discovery))
+                }
+            }
         }
     }
 
-    fn scaffolded_store(&self, source: &Path, discovery: &DiscoveryReport) -> ParsedStore {
-        let selected = discovery
+    fn scaffolded_store(&self, source: &Path, report: &DiscoveryReport) -> ParsedStore {
+        let container = report
             .selected
             .as_ref()
-            .or_else(|| discovery.candidates.first())
             .map(|candidate| candidate.container)
             .unwrap_or(self.requested_container);
-
-        let mut mailbox = Mailbox::new(source.to_path_buf(), selected);
+        let mut mailbox = Mailbox::new(source.to_path_buf(), container);
         mailbox.state = MailboxState::Degraded;
-
-        let fallback_notes = if discovery.fallback_reasons.is_empty() {
-            vec!["fallback enabled due parser failure".to_string()]
-        } else {
-            discovery.fallback_reasons.clone()
+        let fallback_event = ParseEvent {
+            id: ParseEventId::new(),
+            location: None,
+            stage: ParseStage::Discovery,
+            class: ErrorClass::Parse,
+            severity: Severity::Warn,
+            message: "using parser fallback result".to_string(),
+            details: if report.fallback_reasons.is_empty() {
+                None
+            } else {
+                Some(report.fallback_reasons.join("; "))
+            },
+            occurs_at: Utc::now(),
         };
-
-        let mut events = Vec::new();
-        for message in fallback_notes {
-            events.push(ParseEvent {
-                id: ParseEventId::new(),
-                location: None,
-                stage: ParseStage::Discovery,
-                class: ErrorClass::Parse,
-                severity: Severity::Warn,
-                message,
-                details: None,
-                occurs_at: Utc::now(),
-            });
-        }
-
-        if let Some(candidate) = discovery.selected.as_ref() {
-            events.push(ParseEvent {
-                id: ParseEventId::new(),
-                location: None,
-                stage: ParseStage::Discovery,
-                class: ErrorClass::Parse,
-                severity: Severity::Warn,
-                message: format!("selected backend `{}`", candidate.backend_name),
-                details: Some(format!("container {:?}", candidate.container)),
-                occurs_at: Utc::now(),
-            });
-        }
-
-        mailbox.diagnostics = events.clone();
-
-        let folder = Folder {
+        let root = Folder {
             id: FolderId::new(),
             mailbox_id: mailbox.id,
             parent_id: None,
@@ -484,350 +406,357 @@ impl CliExecutor {
             is_hidden: false,
             is_root: true,
         };
-
         ParsedStore {
             mailbox,
-            folders: vec![folder],
+            folders: vec![root],
             messages: Vec::new(),
             attachments: Vec::new(),
-            events,
-            discovery: discovery.clone(),
+            events: vec![fallback_event],
+            discovery: report.clone(),
         }
     }
 
-    fn command_deterministic(&self, command: &SharedCommandOptions, ctx: &ExecutionContext) -> bool {
-        command.deterministic || ctx.deterministic
+    fn folder_lookup(&self, folders: &[Folder]) -> HashMap<FolderId, String> {
+        folders
+            .iter()
+            .map(|folder| (folder.id, folder.path.clone()))
+            .collect()
     }
 
-    fn command_strict(&self, command: &SharedCommandOptions, ctx: &ExecutionContext) -> bool {
-        command.strict || ctx.strict
+    fn resolve_folder<'a>(&self, folders: &'a [Folder], selector: &'a str) -> Option<&'a Folder> {
+        if let Ok(folder_id) = selector.parse::<FolderId>() {
+            return folders.iter().find(|folder| folder.id == folder_id);
+        }
+        folders
+            .iter()
+            .find(|folder| folder.name == selector || folder.path == selector)
     }
 
-    fn page_info(&self, limit: Option<u64>, page_token: &Option<String>) -> CoreResult<PageInfo> {
-        let offset = match page_token {
-            Some(token) => token
-                .parse::<u64>()
-                .map_err(|error| CoreError::invalid_input(format!("invalid page token `{token}`: {error}")))?,
-            None => 0,
-        };
+    fn parse_id<T>(raw: &str, label: &str) -> CoreResult<T>
+    where
+        T: FromStr,
+        T::Err: std::fmt::Display,
+    {
+        raw.parse::<T>()
+            .map_err(|error| CoreError::invalid_input(format!("invalid {label} `{raw}`: {error}")))
+    }
 
-        let limit = limit.unwrap_or(100).max(1);
+    fn page_from_token(&self, options: &SharedCommandOptions, limit_override: Option<u64>) -> CoreResult<PageInfo> {
+        let limit = limit_override.or(options.limit).unwrap_or(100).max(1);
+        let offset = options
+            .page_token
+            .as_ref()
+            .map(|token| {
+                token.parse::<u64>().map_err(|error| {
+                    CoreError::invalid_input(format!("invalid page token `{token}`: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
         Ok(PageInfo {
             limit,
             offset,
             has_more: false,
-            page_token: page_token.clone(),
+            page_token: options.page_token.clone().map(PaginationToken),
             next_page_token: None,
         })
     }
 
-    fn folder_path_to_id(&self, folders: &[Folder], path_or_id: &str) -> Option<FolderId> {
-        folders.iter().find_map(|folder| {
-            if folder.path == path_or_id
-                || folder.name == path_or_id
-                || folder.id.to_string() == path_or_id
-            {
-                Some(folder.id)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn searchable_text(
-        &self,
-        folder_name: Option<&str>,
-        message: &Message,
-    ) -> String {
-        let mut chunks = Vec::new();
-        if let Some(folder_name) = folder_name {
-            chunks.push(folder_name.to_ascii_lowercase());
-        }
-        if let Some(subject) = &message.subject {
-            chunks.push(subject.to_ascii_lowercase());
-        }
-        if let Some(sender) = &message.sender {
-            if let Some(address) = &sender.address {
-                chunks.push(address.to_ascii_lowercase());
-            }
-            if let Some(name) = &sender.display_name {
-                chunks.push(name.to_ascii_lowercase());
-            }
-        }
-        for recipient in &message.recipients {
-            if let Some(address) = &recipient.address {
-                chunks.push(address.to_ascii_lowercase());
-            }
-            if let Some(name) = &recipient.display_name {
-                chunks.push(name.to_ascii_lowercase());
-            }
-        }
-        if let Some(body) = &message.body {
-            if let Some(content_ref) = &body.content_ref {
-                chunks.push(content_ref.to_ascii_lowercase());
-            }
-        }
-        chunks.join(" ")
-    }
-
-    fn build_index_if_needed(
-        &self,
-        parsed: &ParsedStore,
-        deterministic: bool,
-        force: bool,
-    ) -> CoreResult<(u64, u64)> {
-        let mut index = self
-            .index
-            .lock()
-            .map_err(|error| CoreError::invalid_input(format!("index lock poisoned: {error}")))?;
-
+    fn ensure_index(&self, parsed: &ParsedStore, force: bool, deterministic: bool) -> CoreResult<(u64, u64)> {
         let request = IndexBuildRequest {
             mailbox_id: parsed.mailbox.id,
             deterministic,
-            replace_existing: true,
-            source_mode: Some(SearchMode::Indexed),
+            replace_existing: force,
+            source_mode: Some(IndexSearchMode::Indexed),
         };
-        index.request_build(request).map_err(map_index_error)?;
+        let docs = self
+            .build_index_documents(parsed);
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|error| CoreError::io(None, format!("index lock poisoned: {error}")))?;
+        index.request_build(request, deterministic, force)?;
+        index.upsert(parsed.mailbox.id, docs, force, deterministic)?;
+        index.finish(parsed.mailbox.id, deterministic)?;
+        Ok(index.document_count(parsed.mailbox.id), index.segment_count(parsed.mailbox.id))
+    }
 
-        let folder_map: HashMap<FolderId, &Folder> = parsed.folders.iter().map(|folder| (folder.id, folder)).collect();
-        let docs = parsed
+    fn build_index_documents(&self, parsed: &ParsedStore) -> Vec<CliIndexedDocument> {
+        let folder_lookup = self.folder_lookup(&parsed.folders);
+        parsed
             .messages
             .iter()
-            .map(|message| {
-                let folder = folder_map.get(&message.folder_id).map(|folder| folder.path.as_str());
-                IndexedDocument {
-                    message_id: message.id,
-                    folder_id: message.folder_id,
-                    searchable: self.searchable_text(folder.copied(), message),
-                }
+            .map(|message| CliIndexedDocument {
+                message_id: message.id,
+                folder_id: message.folder_id,
+                searchable: searchable_text(message, &folder_lookup),
+            })
+            .collect()
+    }
+
+    fn execute_search_indexed(
+        &self,
+        mailbox_id: MailboxId,
+        query_text: &str,
+        max_results: Option<u64>,
+        deterministic: bool,
+        options: &SharedCommandOptions,
+        mode: SearchMode,
+        include_unindexed: bool,
+    ) -> CoreResult<(Vec<SearchHit>, SearchMode, u64, bool)> {
+        let page = self.page_from_token(options, max_results)?;
+        let mut index_page = page.clone();
+        index_page.limit = u64::MAX;
+        let text = normalize_query(query_text);
+        let index_query = IndexQuery {
+            mailbox_id,
+            text: if text.is_empty() { None } else { Some(text.clone()) },
+            filter: SearchFilter::default(),
+            page: index_page,
+            mode: IndexSearchMode::Indexed,
+            include_unindexed,
+            deterministic,
+            segment_ids: Vec::new(),
+        };
+        let result = self
+            .index
+            .lock()
+            .map_err(|error| CoreError::io(None, format!("index lock poisoned: {error}")))?;
+        let result = result
+            .query(&index_query)
+            .map_err(|error| CoreError::invalid_input(format!("index query failed: {error}")))?;
+        let mut hits: Vec<SearchHit> = result
+            .matches
+            .into_iter()
+            .map(|hit| SearchHit {
+                message_id: hit.message_id,
+                folder_id: hit.folder_id,
+                score: hit.metadata.score,
+                match_source: if mode == SearchMode::Hybrid {
+                    MatchSource::Hybrid
+                } else {
+                    MatchSource::Indexed
+                },
+                matched_fields: hit
+                    .metadata
+                    .matched_fields
+                    .into_iter()
+                    .map(index_field_to_core)
+                    .collect(),
+                snippet: hit.metadata.snippet,
             })
             .collect();
-        index.upsert(parsed.mailbox.id, docs, deterministic, force)?;
-
-        let state = IndexBuildState::Completed {
-            mailbox_id: parsed.mailbox.id,
-            deterministic,
-            total_documents: parsed.messages.len() as u64,
-            total_segments: index.segment_count(parsed.mailbox.id),
-        };
-        index.finish_build(state).map_err(map_index_error)?;
-
+        if deterministic {
+            hits.sort_by(|a, b| {
+                let cmp = a.message_id.to_string().cmp(&b.message_id.to_string());
+                if cmp == Ordering::Equal {
+                    a.folder_id.to_string().cmp(&b.folder_id.to_string())
+                } else {
+                    cmp
+                }
+            });
+        }
+        let total = result.total as usize;
+        let offset = page.offset as usize;
+        let limit = page.limit as usize;
+        let has_more = offset.saturating_add(limit) < total;
+        let hits = hits
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect::<Vec<_>>();
         Ok((
-            index.document_count(parsed.mailbox.id),
-            index.segment_count(parsed.mailbox.id),
+            hits,
+            if mode == SearchMode::Hybrid {
+                SearchMode::Hybrid
+            } else {
+                SearchMode::Indexed
+            },
+            result.total,
+            has_more,
         ))
     }
 
-    fn index_has_data(&self, mailbox_id: &MailboxId) -> CoreResult<bool> {
-        let index = self
-            .index
-            .lock()
-            .map_err(|error| CoreError::invalid_input(format!("index lock poisoned: {error}")))?;
-        Ok(index.document_count(*mailbox_id) > 0)
-    }
-
-    fn ensure_report_summary_file(
+    fn execute_search_full(
         &self,
-        report: &Option<PathBuf>,
-        validation: &ValidationResult,
-    ) -> CoreResult<()> {
-        if let Some(path) = report {
-            let payload = to_string_pretty(validation)
-                .map_err(|error| CoreError::invalid_input(format!("failed to serialize validation report: {error}")))?;
-            let mut file = File::create(path)
-                .map_err(|error| CoreError::io(Some(path.clone()), format!("failed to create validation report: {error}")))?;
-            file.write_all(payload.as_bytes())
-                .map_err(|error| CoreError::io(Some(path.clone()), format!("failed to write validation report: {error}")))?;
+        parsed: &ParsedStore,
+        query: &str,
+        fields: &[String],
+        max_results: Option<u64>,
+        deterministic: bool,
+        options: &SharedCommandOptions,
+    ) -> CoreResult<(Vec<SearchHit>, SearchMode, u64, bool)> {
+        let normalized_fields = selected_search_fields(fields);
+        let terms = normalize_query_terms(query);
+        let mut hits = Vec::new();
+        let folder_lookup = self.folder_lookup(&parsed.folders);
+        for message in &parsed.messages {
+            if terms.is_empty() {
+                continue;
+            }
+            let haystack = fields_searchable_text(message, &folder_lookup);
+            let matched = terms.iter().all(|term| haystack.contains(term));
+            if !matched {
+                continue;
+            }
+            hits.push(SearchHit {
+                message_id: message.id,
+                folder_id: message.folder_id,
+                score: None,
+                match_source: MatchSource::Full,
+                matched_fields: normalized_fields
+                    .iter()
+                    .map(|field| field.to_core())
+                    .collect(),
+                snippet: Some(
+                    snippet_for_terms(&haystack, &terms).unwrap_or_else(|| message.subject.clone().unwrap_or_default()),
+                ),
+            });
         }
-        Ok(())
+        if deterministic {
+            hits.sort_by(|a, b| {
+                let cmp = a.message_id.to_string().cmp(&b.message_id.to_string());
+                if cmp == Ordering::Equal {
+                    a.folder_id.to_string().cmp(&b.folder_id.to_string())
+                } else {
+                    cmp
+                }
+            });
+        }
+        let total = hits.len();
+        let page = self.page_from_token(options, max_results)?;
+        let has_more = (page.offset as usize).saturating_add(page.limit as usize) < total;
+        let offset = page.offset as usize;
+        let hits = hits
+            .into_iter()
+            .skip(offset)
+            .take(page.limit as usize)
+            .collect::<Vec<_>>();
+        Ok((hits, SearchMode::Full, total as u64, has_more))
     }
 
     fn run_export(
         &self,
-        config: ExportConfig,
-        emit_progress: bool,
-        deterministic: bool,
+        source: &Path,
+        options: &SharedCommandOptions,
+        context: &ExecutionContext,
+        command_source: &Path,
+        format: CoreExportFormat,
+        out: &Path,
+        folder_id: Option<FolderId>,
+        message_ids: Vec<MessageId>,
+        attachment_ids: Vec<AttachmentId>,
+        parsed: &ParsedStore,
+        max_messages: Option<u64>,
     ) -> CoreResult<CoreExportResult> {
-        let (handle, receiver) = progress_channel(4096);
+        let deterministic = context.deterministic || options.deterministic;
+        let folder_ids = folder_id.into_iter().collect::<Vec<_>>();
+        let mut config = ExportConfig {
+            source_path: source.to_path_buf(),
+            destination: out.to_path_buf(),
+            mailbox_id: Some(parsed.mailbox.id),
+            folder_ids,
+            message_ids,
+            attachment_ids,
+            format: to_runtime_format(format),
+            deterministic,
+            strict: context.strict || options.strict,
+            checkpoint_path: Some(out.join(".checkpoint")),
+            workers: context.runtime.jobs.max(1),
+            max_messages: max_messages.or(Some(parsed.messages.len() as u64)),
+        };
+
+        // Use command source path to keep deterministic semantics stable.
+        config.source_path = command_source.to_path_buf();
+        let (handle, _receiver) = progress_channel(8);
         let manifest = self
             .export_engine
             .execute(&config, None, &handle, &self.checkpoint_store)
-            .map_err(|error| CoreError::Export {
-                destination: Some(config.destination.clone()),
-                message: format!("export engine failed: {error}"),
-                details: None,
-            })?;
-
-        if emit_progress {
-            while let Ok(event) = receiver.recv_timeout(Duration::from_millis(25)) {
-                let _ = event; // future: route progress to logging sink
-                match event {
-                    // no-op
-                    _ => {}
-                }
-            }
-        }
-
-        let summary = manifest
+            .map_err(|error| CoreError::invalid_input(error.to_string()))?;
+        Ok(manifest
             .core_summary
-            .unwrap_or_else(|| {
-                CoreExportResult {
-                    mailbox_id: config.mailbox_id.unwrap_or_else(MailboxId::new),
-                    requested: manifest.requested,
-                    exported: manifest.exported,
-                    skipped: manifest.skipped,
-                    failed: manifest.failed,
-                    destination: manifest.destination,
-                    manifest_path: manifest.checkpoint_path.clone(),
-                    deterministic,
-                }
-            });
-
-        Ok(summary)
-    }
-
-    fn search_terms(query: &str) -> Vec<String> {
-        query
-            .split_whitespace()
-            .map(|token| token.to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
-    fn query_fields(fields: &[String]) -> Vec<String> {
-        if fields.is_empty() {
-            vec![
-                "subject".to_string(),
-                "sender".to_string(),
-                "folder".to_string(),
-                "body".to_string(),
-            ]
-        } else {
-            fields.iter().map(|field| field.to_ascii_lowercase()).collect()
-        }
-    }
-
-    fn parse_ids<T>(values: &[String], label: &str) -> CoreResult<Vec<T>>
-    where
-        T: FromStr,
-        <T as FromStr>::Err: std::fmt::Display,
-    {
-        let mut ids = Vec::with_capacity(values.len());
-        for value in values {
-            ids.push(
-                value
-                    .parse::<T>()
-                    .map_err(|error| CoreError::invalid_input(format!("invalid {label} `{value}`: {error}")))?,
-            );
-        }
-        Ok(ids)
+            .unwrap_or_else(|| CoreExportResult {
+                mailbox_id: parsed.mailbox.id,
+                requested: config.requested_count(),
+                exported: 0,
+                skipped: 0,
+                failed: 0,
+                destination: out.to_path_buf(),
+                manifest_path: None,
+                deterministic,
+            }))
     }
 }
 
-impl CommandExecutor for CliExecutor {
-    fn execute_info(
-        &self,
-        command: &InfoCommand,
-        context: &ExecutionContext,
-    ) -> CoreResult<Mailbox> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-
-        let mut mailbox = parsed.mailbox;
-        mailbox.folder_count = parsed.folders.len() as u64;
-        mailbox.message_count = parsed.messages.len() as u64;
-        mailbox.attachment_count = parsed.attachments.len() as u64;
-        mailbox.parse_error_count = parsed
-            .events
-            .iter()
-            .filter(|event| matches!(event.severity, Severity::Error | Severity::Fatal))
-            .count() as u64;
-        mailbox.diagnostics = parsed.events;
-        Ok(mailbox)
+impl pst_pst_pst_core::CommandExecutor for CliExecutor {
+    fn execute_info(&self, command: &InfoCommand, context: &ExecutionContext) -> CoreResult<Mailbox> {
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        Ok(parsed.mailbox)
     }
 
-    fn execute_folders(
-        &self,
-        command: &pst_pst_pst_core::FoldersCommand,
-        context: &ExecutionContext,
-    ) -> CoreResult<FolderListResult> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-
-        let mut folders = parsed.folders;
-        if let Some(folder_filter) = &command.folder {
-            folders.retain(|folder| {
-                folder.path == *folder_filter
-                    || folder.name == *folder_filter
-                    || folder.id.to_string() == *folder_filter
-            });
+    fn execute_folders(&self, command: &FoldersCommand, context: &ExecutionContext) -> CoreResult<FolderListResult> {
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let mut folders = parsed.folders.clone();
+        if let Some(folder) = &command.folder {
+            if let Some(selected) = self.resolve_folder(&folders, folder) {
+                folders = vec![selected.clone()];
+            } else {
+                folders.clear();
+            }
         }
-
-        if self.command_deterministic(&command.options, context) {
-            folders.sort_by(|lhs, rhs| lhs.path.cmp(&rhs.path).then(lhs.id.to_string().cmp(&rhs.id.to_string())));
-        }
-
-        let mut page = self.page_info(command.options.limit, &command.options.page_token)?;
-        let start = page.offset as usize;
-        let end = (start + page.limit as usize).min(folders.len());
-        page.has_more = end < folders.len();
-        if page.has_more {
-            page.next_page_token = Some((end as u64).to_string());
-        }
-
+        let page = self.page_from_token(&command.options, None)?;
+        let has_more = (page.offset as usize).saturating_add(page.limit as usize) < folders.len();
+        let scanned = folders.len() as u64;
+        let folders = folders
+            .into_iter()
+            .skip(page.offset as usize)
+            .take(page.limit as usize)
+            .collect::<Vec<_>>();
         Ok(FolderListResult {
             mailbox_id: parsed.mailbox.id,
-            folders: folders.into_iter().skip(start).take(page.limit as usize).collect(),
-            scanned: parsed.folders.len() as u64,
-            page,
+            folders,
+            scanned,
+            page: PageInfo {
+                has_more,
+                ..page
+            },
         })
     }
 
     fn execute_messages(
         &self,
-        command: &MessagesCommand,
+        command: &pst_pst_pst_core::MessagesCommand,
         context: &ExecutionContext,
     ) -> CoreResult<MessageListResult> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-
-        let folder_id = command
-            .folder
-            .as_deref()
-            .and_then(|value| self.folder_path_to_id(&parsed.folders, value));
-
-        let mut messages = parsed.messages;
-        if let Some(folder_id) = folder_id {
-            messages.retain(|message| message.folder_id == folder_id);
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let mut messages = parsed.messages.clone();
+        if let Some(folder) = &command.folder {
+            if let Some(selected) = self.resolve_folder(&parsed.folders, folder) {
+                let folder_id = selected.id;
+                messages.retain(|message| message.folder_id == folder_id);
+            } else {
+                messages.clear();
+            }
         }
-
-        if self.command_deterministic(&command.options, context) {
-            messages.sort_by(|lhs, rhs| lhs.id.to_string().cmp(&rhs.id.to_string()));
-        }
-
-        let mut page = self.page_info(command.options.limit, &command.options.page_token)?;
-        let start = page.offset as usize;
-        let end = (start + page.limit as usize).min(messages.len());
-        page.has_more = end < messages.len();
-        if page.has_more {
-            page.next_page_token = Some((end as u64).to_string());
-        }
-
+        let page = self.page_from_token(&command.options, None)?;
+        let has_more = (page.offset as usize).saturating_add(page.limit as usize) < messages.len();
+        let scanned = messages.len() as u64;
+        let messages = messages
+            .into_iter()
+            .skip(page.offset as usize)
+            .take(page.limit as usize)
+            .collect::<Vec<_>>();
         Ok(MessageListResult {
             mailbox_id: parsed.mailbox.id,
-            folder_id,
-            messages: messages.into_iter().skip(start).take(page.limit as usize).collect(),
-            scanned: parsed.messages.len() as u64,
-            page,
+            folder_id: command.folder.as_ref().and_then(|folder| {
+                self.resolve_folder(&parsed.folders, folder).map(|folder| folder.id)
+            }),
+            messages,
+            scanned,
+            page: PageInfo {
+                has_more,
+                ..page
+            },
         })
     }
 
@@ -836,201 +765,145 @@ impl CommandExecutor for CliExecutor {
         command: &SearchCommand,
         context: &ExecutionContext,
     ) -> CoreResult<pst_pst_pst_core::SearchResult> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let deterministic = command.options.deterministic || context.deterministic;
+        let mode = command.mode;
+        let page = self.page_from_token(&command.options, command.max_results)?;
+        let index_state = self
+            .index
+            .lock()
+            .map_err(|error| CoreError::io(None, format!("index lock poisoned: {error}")))?;
+        let has_index = index_state.has_index(parsed.mailbox.id);
 
-        let deterministic = self.command_deterministic(&command.options, context);
-        let mut page = self.page_info(command.max_results.or(command.options.limit), &command.options.page_token)?;
-        let terms = Self::search_terms(&command.query);
-        if terms.is_empty() {
-            return Err(CoreError::invalid_input("search query cannot be empty"));
-        }
-
-        let folder_map: HashMap<FolderId, &Folder> =
-            parsed.folders.iter().map(|folder| (folder.id, folder)).collect();
-        let has_index = self.index_has_data(&parsed.mailbox.id)?;
-        let force_index = matches!(
-            (command.mode, command.index_policy),
-            (SearchMode::Auto, IndexPolicy::Build)
-                | (SearchMode::Auto, IndexPolicy::Refresh)
-                | (SearchMode::Indexed, IndexPolicy::Build)
-                | (SearchMode::Indexed, IndexPolicy::Refresh)
-                | (SearchMode::Hybrid, IndexPolicy::Build)
-                | (SearchMode::Hybrid, IndexPolicy::Refresh)
-        );
-
-        let source_mode = match command.mode {
-            SearchMode::Full => SearchMode::Full,
-            SearchMode::Indexed => {
-                if has_index {
-                    SearchMode::Indexed
-                } else {
-                    match command.index_policy {
-                        IndexPolicy::Require => {
-                            return Err(CoreError::index(
-                                Some(parsed.mailbox.id.to_string()),
-                                "indexed search requested but no index is available",
-                            ));
-                        }
-                        IndexPolicy::Build | IndexPolicy::Refresh => SearchMode::Indexed,
-                        IndexPolicy::Allow => SearchMode::Full,
-                    }
-                }
-            }
-            SearchMode::Hybrid => {
-                if has_index {
-                    SearchMode::Hybrid
-                } else {
-                    match command.index_policy {
-                        IndexPolicy::Require => {
-                            return Err(CoreError::index(
-                                Some(parsed.mailbox.id.to_string()),
-                                "hybrid search requested but no index is available",
-                            ));
-                        }
-                        IndexPolicy::Build | IndexPolicy::Refresh => SearchMode::Hybrid,
-                        IndexPolicy::Allow => SearchMode::Full,
-                    }
-                }
-            }
+        let use_index = match mode {
+            SearchMode::Full => false,
             SearchMode::Auto => {
-                if force_index || has_index {
-                    SearchMode::Indexed
-                } else {
-                    SearchMode::Full
-                }
+                has_index || matches!(command.index_policy, IndexPolicy::Build | IndexPolicy::Refresh)
+            }
+            SearchMode::Indexed | SearchMode::Hybrid => {
+                has_index
+                    || matches!(command.index_policy, IndexPolicy::Build | IndexPolicy::Refresh)
+                    || command.options.strict
+                    || context.strict
             }
         };
 
-        let effective_mode = source_mode;
-        let mut used_index = false;
-        let fields = Self::query_fields(&command.fields);
-
-        if matches!(effective_mode, SearchMode::Indexed | SearchMode::Hybrid) {
-            if source_mode != SearchMode::Full {
-                let (_documents, _segments) = self.build_index_if_needed(
-                    &parsed,
-                    deterministic,
-                    force_index || !has_index,
-                )?;
-
-                let query = IndexQuery {
-                    mailbox_id: parsed.mailbox.id,
-                    text: Some(command.query.clone()),
-                    filter: SearchFilter::default(),
-                    page: page.clone(),
-                    mode: effective_mode,
-                    include_unindexed: command.include_unindexed,
-                    deterministic,
-                    segment_ids: Vec::new(),
-                };
-
-                let indexed_result = {
-                    let index = self
-                        .index
-                        .lock()
-                        .map_err(|error| CoreError::invalid_input(format!("index lock poisoned: {error}")))?;
-                    index.query(&query).map_err(|error| error)?
-                };
-
-                let total = indexed_result.total;
-                let mut hits = Vec::with_capacity(indexed_result.matches.len());
-                for item in indexed_result.matches {
-                    hits.push(SearchHit {
-                        message_id: item.message_id,
-                        folder_id: item.folder_id,
-                        score: item.metadata.score,
-                        match_source: item.metadata.match_source,
-                        matched_fields: if item.metadata.matched_fields.is_empty() {
-                            vec![FilterField::Raw("indexed".to_string())]
-                        } else {
-                            item.metadata.matched_fields
-                        },
-                        snippet: item.metadata.snippet,
-                    });
-                }
-
-                let returned = hits.len() as u64;
-                let start = page.offset as usize;
-                let end = (start + page.limit as usize).min(hits.len());
-                page.has_more = end < total as usize;
-                if page.has_more {
-                    page.next_page_token = Some((start as u64 + page.limit).to_string());
-                }
-
-                used_index = true;
-                return Ok(pst_pst_pst_core::SearchResult {
-                    mailbox_id: parsed.mailbox.id,
-                    hits: hits.into_iter().skip(start).take(page.limit as usize).collect(),
-                    total,
-                    returned: returned.min(page.limit),
-                    query: Some(command.query.clone()),
-                    source_mode: effective_mode,
-                    include_unindexed: command.include_unindexed,
-                    deterministic,
-                    page,
-                });
-            }
-        }
-
-        if used_index {
-            return Err(CoreError::index(
-                Some(parsed.mailbox.id.to_string()),
-                "index mode fallback path was requested but no indexed path was produced",
+        if command.index_policy == IndexPolicy::Require && !has_index && matches!(mode, SearchMode::Indexed | SearchMode::Hybrid) {
+            return Err(CoreError::invalid_input(
+                "index is required but missing; run `index --build` first",
             ));
         }
 
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for message in &parsed.messages {
-            let folder_name = folder_map.get(&message.folder_id).map(|folder| folder.path.as_str());
-            let haystack = self.searchable_text(folder_name.copied(), message);
-            let mut matched = 0usize;
-            for term in &terms {
-                if haystack.contains(term) {
-                    matched += 1;
-                }
-            }
-            if matched == terms.len() {
-                let snippet = haystack.chars().take(140).collect::<String>();
-                let matched_fields = fields
-                    .iter()
-                    .map(|value| FilterField::Raw(value.to_string()))
-                    .collect();
-                hits.push(SearchHit {
-                    message_id: message.id,
-                    folder_id: message.folder_id,
-                    score: None,
-                    match_source: MatchSource::Full,
-                    matched_fields,
-                    snippet: Some(snippet),
-                });
-            }
+        if use_index && (!has_index || matches!(command.index_policy, IndexPolicy::Build | IndexPolicy::Refresh)) {
+            self.ensure_index(
+                &parsed,
+                matches!(command.index_policy, IndexPolicy::Build | IndexPolicy::Refresh),
+                deterministic,
+            )?;
         }
 
-        if deterministic {
-            hits.sort_by(|lhs, rhs| lhs.message_id.to_string().cmp(&rhs.message_id.to_string()));
-        }
-        let total = hits.len() as u64;
-        let start = page.offset as usize;
-        let end = (start + page.limit as usize).min(hits.len());
-        page.has_more = end < hits.len();
-        if page.has_more {
-            page.next_page_token = Some((start as u64 + page.limit).to_string());
+        let (mut hits, mut source_mode, mut total, has_more_from_index) = if use_index {
+            self.execute_search_indexed(
+                parsed.mailbox.id,
+                &command.query,
+                command.max_results,
+                deterministic,
+                &command.options,
+                mode,
+                command.include_unindexed,
+            )?
+        } else {
+            self.execute_search_full(
+                &parsed,
+                &command.query,
+                &command.fields,
+                command.max_results,
+                deterministic,
+                &command.options,
+            )?
+        };
+
+        if mode == SearchMode::Hybrid && use_index {
+            if command.include_unindexed {
+                let all_options = SharedCommandOptions {
+                    page_token: None,
+                    ..command.options.clone()
+                };
+                let (index_hits, _, index_total, _) = self.execute_search_indexed(
+                    parsed.mailbox.id,
+                    &command.query,
+                    Some(u64::MAX),
+                    deterministic,
+                    &all_options,
+                    mode,
+                    true,
+                )?;
+                let (full_hits, _, full_total, _) = self.execute_search_full(
+                    &parsed,
+                    &command.query,
+                    &command.fields,
+                    Some(u64::MAX),
+                    deterministic,
+                    &all_options,
+                )?;
+
+                let mut merged = index_hits;
+                let mut existing: HashSet<MessageId> = merged.iter().map(|hit| hit.message_id).collect();
+                for hit in full_hits {
+                    if !existing.contains(&hit.message_id) {
+                        merged.push(hit);
+                    }
+                }
+                if deterministic {
+                    merged.sort_by(|a, b| {
+                        let cmp = a.message_id.to_string().cmp(&b.message_id.to_string());
+                        if cmp == Ordering::Equal {
+                            a.folder_id.to_string().cmp(&b.folder_id.to_string())
+                        } else {
+                            cmp
+                        }
+                    });
+                }
+
+                total = merged.len() as u64;
+                hits = merged
+                    .into_iter()
+                    .skip(page.offset as usize)
+                    .take(page.limit as usize)
+                    .collect::<Vec<_>>();
+
+                return Ok(pst_pst_pst_core::SearchResult {
+                    mailbox_id: parsed.mailbox.id,
+                    hits,
+                    total,
+                    returned: hits.len(),
+                    query: Some(command.query.clone()),
+                    source_mode: SearchMode::Hybrid,
+                    include_unindexed: command.include_unindexed,
+                    deterministic,
+                    page: PageInfo {
+                        has_more: page.offset.saturating_add(page.limit) < total,
+                        ..page
+                    },
+                });
+            }
+
+            source_mode = SearchMode::Hybrid;
         }
 
         Ok(pst_pst_pst_core::SearchResult {
             mailbox_id: parsed.mailbox.id,
-            hits: hits.into_iter().skip(start).take(page.limit as usize).collect(),
+            hits,
             total,
-            returned: (end - start) as u64,
+            returned: hits.len(),
             query: Some(command.query.clone()),
-            source_mode: SearchMode::Full,
+            source_mode,
             include_unindexed: command.include_unindexed,
             deterministic,
-            page,
+            page: PageInfo {
+                has_more: has_more_from_index,
+                ..page
+            },
         })
     }
 
@@ -1039,93 +912,63 @@ impl CommandExecutor for CliExecutor {
         command: &pst_pst_pst_core::ExtractCommand,
         context: &ExecutionContext,
     ) -> CoreResult<CoreExportResult> {
-        let parsed = self.parse_store(
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let out = command.out.clone().ok_or_else(|| CoreError::invalid_input("extract requires --out"))?;
+        let mut message_ids = Vec::new();
+        let mut attachment_ids = Vec::new();
+        if let Some(message_id) = &command.message_id {
+            message_ids.push(Self::parse_id::<MessageId>(message_id, "message-id")?);
+        }
+        if let Some(attachment_id) = &command.attachment_id {
+            attachment_ids.push(Self::parse_id::<AttachmentId>(attachment_id, "attachment-id")?);
+        }
+        self.run_export(
             &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-
-        let deterministic = self.command_deterministic(&command.options, context);
-        let strict = self.command_strict(&command.options, context);
-        let message_ids = match command.message_id.as_ref() {
-            Some(id) => vec![id.parse::<MessageId>().map_err(|error| {
-                CoreError::invalid_input(format!("invalid message id `{id}`: {error}"))
-            })?],
-            None => Vec::new(),
-        };
-        let attachment_ids = match command.attachment_id.as_ref() {
-            Some(id) => vec![id.parse::<AttachmentId>().map_err(|error| {
-                CoreError::invalid_input(format!("invalid attachment id `{id}`: {error}"))
-            })?],
-            None => Vec::new(),
-        };
-
-        let config = ExportConfig {
-            source_path: command.source.clone(),
-            destination: command.out.clone(),
-            mailbox_id: Some(parsed.mailbox.id),
-            folder_ids: Vec::new(),
+            &command.options,
+            context,
+            &command.source,
+            CoreExportFormat::Jsonl,
+            &out,
+            None,
             message_ids,
             attachment_ids,
-            format: ExportRuntimeFormat::Eml,
-            deterministic,
-            strict,
-            checkpoint_path: Some(command.out.join(".pst-pst-pst-extract.checkpoint")),
-            workers: context.runtime.jobs,
-            max_messages: Some(1),
-        };
-        self.run_export(config, false, deterministic)
+            &parsed,
+            Some(1),
+        )
     }
 
     fn execute_export(
         &self,
-        command: &pst_pst_pst_core::ExportCommand,
+        command: &ExportCommand,
         context: &ExecutionContext,
     ) -> CoreResult<CoreExportResult> {
-        let parsed = self.parse_store(
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let out = command.out.clone().ok_or_else(|| CoreError::invalid_input("export requires --out"))?;
+        let folder_id = command.folder.as_ref().and_then(|selector| {
+            self.resolve_folder(&parsed.folders, selector).map(|folder| folder.id)
+        });
+        let message_ids = command
+            .message_ids
+            .iter()
+            .map(|raw| Self::parse_id::<MessageId>(raw, "message-id"))
+            .collect::<CoreResult<Vec<_>>>()?;
+        self.run_export(
             &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-        let deterministic = self.command_deterministic(&command.options, context);
-        let strict = self.command_strict(&command.options, context);
-
-        let message_ids = Self::parse_ids::<MessageId>(&command.message_ids, "message-id")?;
-        let mut folder_ids = Vec::new();
-        if let Some(folder) = &command.folder {
-            if let Ok(id) = folder.parse::<FolderId>() {
-                folder_ids.push(id);
-            } else if !folder.trim().is_empty() {
-                return Err(CoreError::invalid_input(format!(
-                    "unsupported folder selector in CLI: `{folder}` (expected folder id)"
-                )));
-            }
-        }
-
-        let format = match command.format {
-            ExportFormat::Eml => ExportRuntimeFormat::Eml,
-            ExportFormat::Mbox => ExportRuntimeFormat::Mbox,
-            ExportFormat::Json => ExportRuntimeFormat::Json,
-            ExportFormat::Jsonl => ExportRuntimeFormat::Jsonl,
-            ExportFormat::Msg => ExportRuntimeFormat::Binary,
-        };
-
-        let config = ExportConfig {
-            source_path: command.source.clone(),
-            destination: command.out.clone(),
-            mailbox_id: Some(parsed.mailbox.id),
-            folder_ids,
+            &command.options,
+            context,
+            &command.source,
+            command.format,
+            &out,
+            folder_id,
             message_ids,
-            attachment_ids: Vec::new(),
-            format,
-            deterministic,
-            strict,
-            checkpoint_path: Some(command.out.join(".pst-pst-pst-export.checkpoint")),
-            workers: context.runtime.jobs,
-            max_messages: Some(parsed.messages.len() as u64),
-        };
-
-        self.run_export(config, !matches!(context.output, OutputFormat::Table), deterministic)
+            Vec::new(),
+            &parsed,
+            if command.message_ids.is_empty() {
+                Some(parsed.messages.len() as u64)
+            } else {
+                None
+            },
+        )
     }
 
     fn execute_validate(
@@ -1133,38 +976,34 @@ impl CommandExecutor for CliExecutor {
         command: &ValidateCommand,
         context: &ExecutionContext,
     ) -> CoreResult<ValidationResult> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-
-        let passed = !parsed
-            .events
-            .iter()
-            .any(|event| matches!(event.severity, Severity::Error | Severity::Fatal));
-        let warnings = parsed
-            .events
-            .iter()
-            .filter(|event| event.severity == Severity::Warn)
-            .count() as u64;
-        let errors = parsed
-            .events
-            .iter()
-            .filter(|event| matches!(event.severity, Severity::Error | Severity::Fatal))
-            .count() as u64;
-
-        let mut result = ValidationResult {
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let mut warnings = 0u64;
+        let mut errors = 0u64;
+        let mut scan_events = parsed.events;
+        scan_events.extend(parsed.mailbox.diagnostics.clone());
+        for event in &scan_events {
+            if event.severity == Severity::Warn {
+                warnings = warnings.saturating_add(1);
+            } else if event.severity == Severity::Error || event.severity == Severity::Fatal {
+                errors = errors.saturating_add(1);
+            }
+        }
+        let passed = errors == 0;
+        let scanned_items = (parsed.folders.len() + parsed.messages.len() + parsed.attachments.len()) as u64;
+        if let Some(report_path) = command.report {
+            let serialized = to_string_pretty(&scan_events)
+                .map_err(|error| CoreError::invalid_input(format!("validate report failed: {error}")))?;
+            std::fs::write(report_path, serialized)
+                .map_err(|error| CoreError::io(None, format!("write validate report failed: {error}")))?;
+        }
+        Ok(ValidationResult {
             mailbox_id: parsed.mailbox.id,
             passed,
-            scanned_items: parsed.messages.len() as u64 + parsed.attachments.len() as u64,
+            scanned_items,
             warnings,
             errors,
-            events: parsed.events,
-        };
-
-        self.ensure_report_summary_file(&command.report, &result)?;
-        Ok(std::mem::take(&mut result))
+            events: scan_events,
+        })
     }
 
     fn execute_index(
@@ -1172,33 +1011,32 @@ impl CommandExecutor for CliExecutor {
         command: &IndexCommand,
         context: &ExecutionContext,
     ) -> CoreResult<IndexResult> {
-        let parsed = self.parse_store(
-            &command.source,
-            self.command_strict(&command.options, context),
-            self.command_deterministic(&command.options, context),
-        )?;
-        let deterministic = self.command_deterministic(&command.options, context);
-
-        let (documents, segments) = self.build_index_if_needed(
-            &parsed,
-            deterministic,
-            command.rebuild || !self.index_has_data(&parsed.mailbox.id)?,
-        )?;
-
+        let parsed = self.parse_store(&command.source, &command.options, context)?;
+        let deterministic = command.options.deterministic || context.deterministic;
+        let has_index = self
+            .index
+            .lock()
+            .map_err(|error| CoreError::io(None, format!("index lock poisoned: {error}")))?
+            .has_index(parsed.mailbox.id);
+        if !has_index || command.rebuild {
+            self.ensure_index(&parsed, command.rebuild || !has_index, deterministic)?;
+        }
+        let (documents, segments) = self
+            .index
+            .lock()
+            .map_err(|error| CoreError::io(None, format!("index lock poisoned: {error}")))?
+            .document_and_segment_counts(parsed.mailbox.id);
+        let now = Some(Utc::now());
         Ok(IndexResult {
             mailbox_id: Some(parsed.mailbox.id),
             db_path: command.db.clone(),
             mode: SearchMode::Indexed,
-            policy: if command.rebuild {
-                IndexPolicy::Build
-            } else {
-                IndexPolicy::Allow
-            },
+            policy: IndexPolicy::Allow,
             deterministic,
             documents,
             segments,
-            started_at: Some(Utc::now()),
-            completed_at: Some(Utc::now()),
+            started_at: now,
+            completed_at: now,
         })
     }
 
@@ -1207,57 +1045,23 @@ impl CommandExecutor for CliExecutor {
         command: &WatchCommand,
         _context: &ExecutionContext,
     ) -> CoreResult<WatchResult> {
-        if command.dir.as_os_str().is_empty() {
-            return Err(CoreError::invalid_input("watch directory is required"));
-        }
-        if command.on_changed.trim().is_empty() {
-            return Err(CoreError::invalid_input("on-changed command is required"));
-        }
-
         let pattern = command.pattern.clone().unwrap_or_else(|| "*".to_string());
-        let mut seen: HashMap<PathBuf, u64> = HashMap::new();
+        let discovered = discover_files(&command.dir, &pattern)?;
         let mut processed = 0u64;
         let mut failed = 0u64;
-        let mut matched_files = 0u64;
         let mut last_error = None;
-        let mut cycle = 0u64;
-        let max_cycles = std::env::var("PST_PST_PST_WATCH_CYCLES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-
-        loop {
-            let current = discover_files(&command.dir, &pattern)?;
-            for (path, modified) in current {
-                let changed = match seen.get(&path) {
-                    Some(previous) => *previous != modified,
-                    None => true,
-                };
-                if changed {
-                    matched_files = matched_files.saturating_add(1);
-                    processed = processed.saturating_add(1);
-                    let rendered = render_on_changed_template(&command.on_changed, &path);
-                    if let Err(error) = run_on_changed(&rendered) {
-                        failed = failed.saturating_add(1);
-                        last_error = Some(error.to_string());
-                    } else {
-                        last_error = None;
-                    }
-                }
-                seen.insert(path, modified);
+        for path in discovered.keys() {
+            let rendered = render_on_changed_template(&command.on_changed, path);
+            if let Err(error) = run_on_changed(&rendered) {
+                failed = failed.saturating_add(1);
+                last_error = Some(error.to_string());
+            } else {
+                processed = processed.saturating_add(1);
             }
-
-            cycle = cycle.saturating_add(1);
-            if let Some(max_cycles) = max_cycles {
-                if cycle >= max_cycles {
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(750));
         }
-
         Ok(WatchResult {
             watched_dir: command.dir.clone(),
-            matched_files,
+            matched_files: discovered.len() as u64,
             processed_events: processed,
             failed,
             last_error,
@@ -1267,465 +1071,419 @@ impl CommandExecutor for CliExecutor {
     fn execute_ui(
         &self,
         command: &CoreUiCommand,
-        context: &ExecutionContext,
-    ) -> CoreResult<pst_pst_pst_ui::UiResult> {
-        let ui_output = match context.output {
-            OutputFormat::Json => UiOutput::Jsonl,
-            OutputFormat::Jsonl => UiOutput::Jsonl,
-            OutputFormat::Ndjson => UiOutput::Ndjson,
-            _ => UiOutput::Text,
-        };
-        let ui_config = UiConfig {
-            mode: UiMode::Terminal,
-            output: ui_output,
-            deterministic: context.deterministic,
-            max_history: 256,
-        };
-
-        let bus = CliUiBus::new(self.clone(), context.clone());
-        let mut ui = TerminalUi::new(bus, ui_config);
-        println!("ui session: bind={}", command.bind);
-
+        _context: &ExecutionContext,
+    ) -> CoreResult<UiResult> {
+        let mut ui = TerminalUi::new(
+            CliUiBus::new(self.clone(), command.bind.clone()),
+            UiConfig {
+                mode: UiMode::Terminal,
+                output: UiOutput::Text,
+                deterministic: true,
+                max_history: 128,
+            },
+        );
+        let start = now_millis();
+        println!("pst-pst-pst ui session bind={}", command.bind);
+        println!("commands: info folders messages search extract export validate index watch quit");
         let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|error| {
-                CoreError::io(
-                    None,
-                    format!("failed to read UI line: {error}"),
-                )
-            })?;
-            let (events, rendered) = ui.submit(&line);
-            for line in rendered {
+        let mut input = String::new();
+        let mut session_handle = io::stdout();
+        loop {
+            session_handle
+                .write_all(b"pst> ")
+                .map_err(|error| CoreError::io(None, format!("write prompt failed: {error}")))?;
+            session_handle.flush()?;
+            input.clear();
+            let read = stdin
+                .lock()
+                .read_line(&mut input)
+                .map_err(|error| CoreError::io(None, format!("read ui line failed: {error}")))?;
+            if read == 0 {
+                break;
+            }
+            if input.trim().is_empty() {
+                continue;
+            }
+            let (_events, lines) = ui.submit(input.trim_end());
+            for line in lines {
                 println!("{line}");
             }
-            if events.iter().any(|event| matches!(event, UiEvent::Exit { .. })) {
+            if _events.iter().any(|event| matches!(event, UiEvent::Exit { .. })) {
                 break;
             }
         }
-
-        Ok(pst_pst_pst_ui::UiResult {
-            session_id: format!("ui-{}", command.bind),
+        Ok(UiResult {
+            session_id: format!("ui-{start}"),
             bind: command.bind.clone(),
             destination: None,
             started: true,
-            deterministic: context.deterministic,
+            deterministic: true,
         })
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct CliIndex {
-    docs: HashMap<MailboxId, Vec<IndexedDocument>>,
-    segments: HashMap<MailboxId, Vec<IndexSegment>>,
-    states: HashMap<MailboxId, IndexBuildState>,
+    mailboxes: HashMap<MailboxId, CliMailboxIndex>,
 }
 
 #[derive(Clone)]
-struct IndexedDocument {
+struct CliMailboxIndex {
+    generation: u64,
+    deterministic: bool,
+    documents: Vec<CliIndexedDocument>,
+    segments: Vec<IndexSegment>,
+    state: IndexBuildState,
+}
+
+impl Default for CliMailboxIndex {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            deterministic: false,
+            documents: Vec::new(),
+            segments: Vec::new(),
+            state: IndexBuildState::Unknown,
+        }
+    }
+}
+
+impl CliMailboxIndex {
+    fn complete_count(&self) -> bool {
+        matches!(self.state, IndexBuildState::Completed { .. })
+    }
+}
+
+#[derive(Clone)]
+struct CliIndexedDocument {
     message_id: MessageId,
     folder_id: FolderId,
     searchable: String,
 }
 
 impl CliIndex {
-    fn document_count(&self, mailbox_id: MailboxId) -> u64 {
-        self.docs.get(&mailbox_id).map(|docs| docs.len() as u64).unwrap_or(0)
+    fn has_index(&self, mailbox_id: MailboxId) -> bool {
+        self.mailboxes
+            .get(&mailbox_id)
+            .is_some_and(CliMailboxIndex::complete_count)
     }
 
-    fn segment_count(&self, mailbox_id: MailboxId) -> u64 {
-        self.segments
-            .get(&mailbox_id)
-            .map(|segments| segments.len() as u64)
-            .unwrap_or(0)
+    fn request_build(
+        &mut self,
+        request: IndexBuildRequest,
+        _deterministic: bool,
+        force: bool,
+    ) -> CoreResult<()> {
+        let entry = self
+            .mailboxes
+            .entry(request.mailbox_id)
+            .or_insert_with(CliMailboxIndex::default);
+        if force {
+            entry.documents.clear();
+            entry.segments.clear();
+        }
+        entry.state = IndexBuildState::Queued;
+        Ok(())
     }
 
     fn upsert(
         &mut self,
         mailbox_id: MailboxId,
-        mut docs: Vec<IndexedDocument>,
+        documents: Vec<CliIndexedDocument>,
+        force: bool,
         deterministic: bool,
-        replace: bool,
     ) -> CoreResult<()> {
-        if replace {
-            self.docs.remove(&mailbox_id);
-            self.segments.remove(&mailbox_id);
+        let entry = self
+            .mailboxes
+            .get_mut(&mailbox_id)
+            .ok_or_else(|| CoreError::invalid_input("missing index build request"))?;
+        if force {
+            entry.documents.clear();
+            entry.segments.clear();
         }
-        if deterministic {
-            docs.sort_by(|lhs, rhs| lhs.message_id.to_string().cmp(&rhs.message_id.to_string()));
-        }
+        entry.generation = entry.generation.saturating_add(1);
+        entry.deterministic = deterministic;
+        entry.documents = documents;
+        entry.state = IndexBuildState::Running(pst_pst_pst_index::IndexBuildProgress {
+            batches_processed: 1,
+            documents_seen: entry.documents.len() as u64,
+            documents_total: Some(entry.documents.len() as u64),
+            segments_completed: 0,
+            segments_total: Some(1),
+        });
         let segment = IndexSegment {
-            segment_id: format!("{mailbox_id}-seg0"),
+            segment_id: format!("seg-{}-{}", mailbox_id, entry.generation),
             mailbox_id,
-            generation: 1,
-            document_count: docs.len() as u64,
+            generation: entry.generation,
+            document_count: entry.documents.len() as u64,
             checksum: None,
             deterministic,
         };
-        self.docs.insert(mailbox_id, docs);
-        self.segments.insert(mailbox_id, vec![segment]);
+        entry.segments.push(segment);
+        entry.state = IndexBuildState::Running(pst_pst_pst_index::IndexBuildProgress {
+            batches_processed: 1,
+            documents_seen: entry.documents.len() as u64,
+            documents_total: Some(entry.documents.len() as u64),
+            segments_completed: 1,
+            segments_total: Some(1),
+        });
         Ok(())
     }
-}
 
-impl IndexReader for CliIndex {
-    type Error = CoreError;
+    fn finish(&mut self, mailbox_id: MailboxId, deterministic: bool) -> CoreResult<()> {
+        let entry = self
+            .mailboxes
+            .get_mut(&mailbox_id)
+            .ok_or_else(|| CoreError::invalid_input("missing index state"))?;
+        let total_documents = entry.documents.len() as u64;
+        let total_segments = entry.segments.len() as u64;
+        entry.state = IndexBuildState::Completed {
+            mailbox_id,
+            deterministic,
+            total_documents,
+            total_segments,
+        };
+        Ok(())
+    }
 
-    fn query(&self, query: &IndexQuery) -> Result<IndexQueryResult, Self::Error> {
-        let docs = self
-            .docs
-            .get(&query.mailbox_id)
-            .ok_or_else(|| CoreError::index(Some(query.mailbox_id.to_string()), "missing indexed documents"))?;
-        let segments = self.segments.get(&query.mailbox_id).cloned().unwrap_or_default();
+    fn query(&self, request: &IndexQuery) -> CoreResult<IndexQueryResult> {
+        let entry = self
+            .mailboxes
+            .get(&request.mailbox_id)
+            .ok_or_else(|| CoreError::invalid_input("index missing"))?;
+        if !entry.complete_count() {
+            return Err(CoreError::invalid_input("index not ready"));
+        }
 
-        let terms = query
-            .text
-            .as_deref()
-            .unwrap_or("")
-            .split_whitespace()
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-
-        let mut matches = Vec::new();
-        for doc in docs {
-            let text = doc.searchable.as_str();
-            if terms.iter().all(|term| text.contains(term)) {
-                matches.push(IndexMatch {
-                    message_id: doc.message_id,
-                    folder_id: doc.folder_id,
-                    metadata: IndexMatchMetadata {
-                        match_source: MatchSource::Indexed,
-                        score: Some(terms.len() as f64),
-                        matched_fields: vec![FilterField::Raw("indexed-text".to_string())],
-                        snippet: Some(doc.searchable.chars().take(140).collect()),
-                    },
-                });
+        let termset = normalize_query_terms(request.text.as_deref().unwrap_or(""));
+        let mut indexed_matches = Vec::new();
+        for doc in &entry.documents {
+            if termset.iter().all(|term| doc.searchable.contains(term)) {
+                indexed_matches.push((doc.message_id, doc.folder_id));
             }
         }
 
-        let total = matches.len() as u64;
-        let start = query.page.offset as usize;
-        let mut matched = matches;
-        if query.deterministic {
-            matched.sort_by(|lhs, rhs| lhs.message_id.to_string().cmp(&rhs.message_id.to_string()));
+        if request.deterministic {
+            indexed_matches.sort_by(|(left, _), (right, _)| left.to_string().cmp(&right.to_string()));
         }
-        let end = (start + query.page.limit as usize).min(matched.len());
-        let returned_hits = matched
+
+        let offset = request.page.offset as usize;
+        let limit = request.page.limit as usize;
+        let total = indexed_matches.len() as u64;
+        let matches = indexed_matches
             .into_iter()
-            .skip(start)
-            .take(query.page.limit as usize)
+            .skip(offset)
+            .take(limit)
+            .map(|(message_id, folder_id)| {
+                IndexMatch {
+                    message_id,
+                    folder_id,
+                    metadata: IndexMatchMetadata {
+                        match_source: MatchSource::Indexed,
+                        score: None,
+                        matched_fields: vec![IndexFilterField::Body],
+                        snippet: None,
+                    },
+                }
+            })
             .collect::<Vec<_>>();
-
-        let cloned_query = IndexQuery {
-            mailbox_id: query.mailbox_id,
-            text: query.text.clone(),
-            filter: query.filter.clone(),
-            page: query.page.clone(),
-            mode: query.mode,
-            include_unindexed: query.include_unindexed,
-            deterministic: query.deterministic,
-            segment_ids: query.segment_ids.clone(),
-        };
-
+        let segments = entry
+            .segments
+            .iter()
+            .map(|segment| IndexedSegmentResult {
+                segment_id: segment.segment_id.clone(),
+                matches: vec![],
+            })
+            .collect::<Vec<_>>();
         Ok(IndexQueryResult {
-            mailbox_id: query.mailbox_id,
-            query: cloned_query,
-            matches: returned_hits,
+            mailbox_id: request.mailbox_id,
+            query: request.clone(),
+            matches,
             segments,
             total,
-            returned: total as usize,
-            deterministic: query.deterministic,
+            returned: matches.len(),
+            deterministic: request.deterministic,
         })
     }
 
-    fn get_segment(&self, segment_id: &str) -> Result<Option<IndexSegment>, Self::Error> {
-        for (_, segments) in &self.segments {
-            if let Some(segment) = segments.iter().find(|segment| segment.segment_id == segment_id) {
-                return Ok(Some(segment.clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    fn list_segments(&self, mailbox_id: MailboxId) -> Result<Vec<IndexSegment>, Self::Error> {
-        Ok(self.segments.get(&mailbox_id).cloned().unwrap_or_default())
-    }
-
-    fn build_state(&self, mailbox_id: MailboxId) -> IndexBuildState {
-        self.states.get(&mailbox_id).cloned().unwrap_or(IndexBuildState::Unknown)
+    fn document_and_segment_counts(&self, mailbox_id: MailboxId) -> (u64, u64) {
+        self.mailboxes
+            .get(&mailbox_id)
+            .map(|entry| (entry.documents.len() as u64, entry.segments.len() as u64))
+            .unwrap_or((0, 0))
     }
 }
 
-impl IndexWriter for CliIndex {
-    type Error = CoreError;
-
-    fn request_build(
-        &mut self,
-        request: IndexBuildRequest,
-    ) -> Result<IndexBuildState, Self::Error> {
-        let state = IndexBuildState::Running {
-            batches_processed: 0,
-            documents_seen: 0,
-            documents_total: None,
-            segments_completed: 0,
-            segments_total: None,
-        };
-        self.states.insert(request.mailbox_id, state.clone());
-        if request.replace_existing {
-            self.docs.remove(&request.mailbox_id);
-            self.segments.remove(&request.mailbox_id);
-        }
-        Ok(state)
-    }
-
-    fn remove_segment(&mut self, segment_id: &str) -> Result<IndexBuildState, Self::Error> {
-        for (_, segments) in self.segments.iter_mut() {
-            segments.retain(|segment| segment.segment_id != segment_id);
-        }
-        let id = self
-            .states
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or_else(MailboxId::new);
-        Ok(self
-            .states
-            .entry(id)
-            .or_insert(IndexBuildState::NotRequested)
-            .clone())
-    }
-
-    fn replace_segment(&mut self, segment: IndexSegment) -> Result<(), Self::Error> {
-        let list = self
-            .segments
-            .entry(segment.mailbox_id)
-            .or_insert_with(Vec::new);
-        match list.iter_mut().find(|existing| existing.segment_id == segment.segment_id) {
-            Some(existing) => *existing = segment,
-            None => list.push(segment),
-        }
-        Ok(())
-    }
-
-    fn finish_build(&mut self, state: IndexBuildState) -> Result<(), Self::Error> {
-        let mailbox_id = match state {
-            IndexBuildState::Completed { mailbox_id, .. } => mailbox_id,
-            IndexBuildState::Failed { mailbox_id, .. } => mailbox_id,
-            IndexBuildState::Queued => {
-                return Err(CoreError::index(Some("global".to_string()), "build not completed"));
-            }
-            IndexBuildState::Running(_) => {
-                return Err(CoreError::index(Some("global".to_string()), "build not completed"));
-            }
-            IndexBuildState::Unknown => MailboxId::new(),
-        };
-        self.states.insert(mailbox_id, state);
-        Ok(())
-    }
+fn normalize_query(query: &str) -> String {
+    query.to_ascii_lowercase()
 }
 
-impl IndexEngine for CliIndex {
-    type Error = CoreError;
-    type Reader = Self;
-    type Writer = Self;
+fn normalize_query_terms(query: &str) -> Vec<String> {
+    normalize_query(query)
+        .split_whitespace()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+}
 
-    fn reader(&self) -> &Self::Reader {
-        self
-    }
-
-    fn writer(&mut self) -> &mut Self::Writer {
-        self
-    }
+fn selected_search_fields(raw: &[String]) -> Vec<SearchFieldSpec> {
+    let normalized = if raw.is_empty() {
+        vec!["subject".to_string(), "sender".to_string(), "body".to_string(), "folder".to_string()]
+    } else {
+        raw.iter().map(|value| value.to_ascii_lowercase()).collect()
+    };
+    normalized.into_iter().map(SearchFieldSpec::from).collect()
 }
 
 #[derive(Clone)]
-struct CliUiBus {
-    executor: CliExecutor,
-    context: ExecutionContext,
+struct SearchFieldSpec {
+    name: String,
 }
 
-impl CliUiBus {
-    fn new(executor: CliExecutor, context: ExecutionContext) -> Self {
-        Self { executor, context }
+impl From<String> for SearchFieldSpec {
+    fn from(name: String) -> Self {
+        Self { name }
+    }
+}
+
+impl SearchFieldSpec {
+    fn to_core(&self) -> FilterField {
+        match self.name.as_str() {
+            "subject" => FilterField::Subject,
+            "sender" => FilterField::Sender,
+            "recipient" => FilterField::Recipient,
+            "folder" => FilterField::Folder,
+            "has_attachment" | "has-attachment" => FilterField::HasAttachment,
+            "size" => FilterField::Size,
+            "id" => FilterField::Id,
+            "sentat" | "sent_at" => FilterField::SentAt,
+            "receivedat" | "received_at" => FilterField::ReceivedAt,
+            "modifiedat" | "modified_at" => FilterField::ModifiedAt,
+            "messageclass" | "message_class" => FilterField::MessageClass,
+            _ => FilterField::Raw(self.name.clone()),
+        }
     }
 
-    fn parse_command(&self, command: &UiShellCommand) -> CoreResult<CoreCommand> {
-        let shared = SharedCommandOptions {
-            filter: Vec::new(),
-            output: OutputFormat::Table,
-            limit: None,
-            sort: None,
-            deterministic: self.context.deterministic,
-            strict: self.context.strict,
-            page_token: None,
-        };
-
-        match command.kind {
-            UiCommandKind::Info => Ok(CoreCommand::Info(InfoCommand {
-                source: PathBuf::from(
-                    command
-                        .args
-                        .first()
-                        .ok_or_else(|| CoreError::invalid_input("ui info expects source"))?
-                        .to_string(),
-                ),
-                options: shared,
-            })),
-            UiCommandKind::Folders => {
-                let source = command
-                    .args
-                    .first()
-                    .ok_or_else(|| CoreError::invalid_input("ui folders expects source"))?;
-                Ok(CoreCommand::Folders(pst_pst_pst_core::FoldersCommand {
-                    source: PathBuf::from(source),
-                    folder: command.args.get(1).cloned(),
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Messages => {
-                let source = command
-                    .args
-                    .first()
-                    .ok_or_else(|| CoreError::invalid_input("ui messages expects source"))?;
-                Ok(CoreCommand::Messages(pst_pst_pst_core::MessagesCommand {
-                    source: PathBuf::from(source),
-                    folder: command.args.get(1).cloned(),
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Search => {
-                if command.args.len() < 2 {
-                    return Err(CoreError::invalid_input("ui search expects `source` and `query`"));
-                }
-                Ok(CoreCommand::Search(SearchCommand {
-                    source: PathBuf::from(command.args[0].as_str()),
-                    query: command.args[1..].join(" "),
-                    fields: Vec::new(),
-                    mode: SearchMode::Auto,
-                    index_policy: IndexPolicy::Allow,
-                    include_unindexed: true,
-                    max_results: None,
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Extract => {
-                if command.args.len() < 2 {
-                    return Err(CoreError::invalid_input(
-                        "ui extract expects `source` and `message-id|attachment-id`",
-                    ));
-                }
-                Ok(CoreCommand::Extract(pst_pst_pst_core::ExtractCommand {
-                    source: PathBuf::from(command.args[0].as_str()),
-                    message_id: command.args.get(1).cloned(),
-                    attachment_id: None,
-                    out: Some(PathBuf::from("out")),
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Export => {
-                if command.args.len() < 2 {
-                    return Err(CoreError::invalid_input("ui export expects `source` and `out`"));
-                }
-                Ok(CoreCommand::Export(pst_pst_pst_core::ExportCommand {
-                    source: PathBuf::from(command.args[0].as_str()),
-                    format: ExportFormat::Jsonl,
-                    out: Some(PathBuf::from(command.args[1].as_str())),
-                    folder: None,
-                    message_ids: command.args[2..].to_vec(),
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Validate => {
-                Ok(CoreCommand::Validate(ValidateCommand {
-                    source: PathBuf::from(
-                        command
-                            .args
-                            .first()
-                            .ok_or_else(|| CoreError::invalid_input("ui validate expects source"))?,
-                    ),
-                    report: None,
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Index => {
-                let source = command
-                    .args
-                    .first()
-                    .ok_or_else(|| CoreError::invalid_input("ui index expects source"))?;
-                Ok(CoreCommand::Index(IndexCommand {
-                    source: PathBuf::from(source),
-                    db: command.args.get(1).map(PathBuf::from),
-                    rebuild: false,
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Watch => {
-                let dir = command
-                    .args
-                    .first()
-                    .ok_or_else(|| CoreError::invalid_input("ui watch expects dir"))?;
-                Ok(CoreCommand::Watch(WatchCommand {
-                    dir: PathBuf::from(dir),
-                    pattern: command.args.get(1).cloned(),
-                    on_changed: command
-                        .args
-                        .get(2)
-                        .cloned()
-                        .unwrap_or_else(|| "echo {path}".to_string()),
-                    options: shared,
-                }))
-            }
-            UiCommandKind::Help => Err(CoreError::unsupported("help command handled by renderer")),
-            UiCommandKind::Quit => Err(CoreError::unsupported("quit command handled by UI runtime")),
-            UiCommandKind::Unknown(_) => Err(CoreError::unsupported("unsupported ui command")),
+    fn matches(&self, message: &Message, folder_lookup: &HashMap<FolderId, String>) -> String {
+        match self.name.as_str() {
+            "subject" => message.subject.clone().unwrap_or_default(),
+            "sender" => message
+                .sender
+                .as_ref()
+                .and_then(|sender| sender.address.clone())
+                .unwrap_or_default(),
+            "recipient" => message
+                .recipients
+                .iter()
+                .filter_map(|recipient| recipient.address.clone())
+                .collect::<Vec<_>>()
+                .join(" "),
+            "folder" => folder_lookup
+                .get(&message.folder_id)
+                .cloned()
+                .unwrap_or_default(),
+            "body" => message.body.as_ref().and_then(|body| body.content_ref.clone()).unwrap_or_default(),
+            "has_attachment" => message.has_attachments.to_string(),
+            "size" => message.size.to_string(),
+            _ => String::new(),
         }
     }
 }
 
-impl UiCommandBus for CliUiBus {
-    type Error = CoreError;
-
-    fn execute(
-        &mut self,
-        _state: &UiState,
-        command: &UiShellCommand,
-    ) -> Result<UiCommandResult, Self::Error> {
-        if matches!(command.kind, UiCommandKind::Help) {
-            return Ok(UiCommandResult {
-                command_id: 0,
-                exit: false,
-                status: Some("available: info folders messages search extract export validate index watch quit".to_string()),
-                payload: Some(UiPayload::Text("help".to_string())),
-            });
+fn searchable_text(message: &Message, folder_lookup: &HashMap<FolderId, String>) -> String {
+    let mut text = Vec::new();
+    if let Some(subject) = &message.subject {
+        text.push(subject.to_lowercase());
+    }
+    if let Some(sender) = &message.sender {
+        if let Some(address) = &sender.address {
+            text.push(address.to_ascii_lowercase());
         }
-
-        if matches!(command.kind, UiCommandKind::Quit) {
-            return Ok(UiCommandResult {
-                command_id: 0,
-                exit: true,
-                status: Some("quit".to_string()),
-                payload: Some(UiPayload::Text("bye".to_string())),
-            });
+        if let Some(name) = &sender.display_name {
+            text.push(name.to_ascii_lowercase());
         }
+    }
+    for recipient in &message.recipients {
+        if let Some(address) = &recipient.address {
+            text.push(address.to_ascii_lowercase());
+        }
+        if let Some(name) = &recipient.display_name {
+            text.push(name.to_ascii_lowercase());
+        }
+    }
+    if let Some(body) = &message.body {
+        if let Some(content) = &body.content_ref {
+            text.push(content.to_ascii_lowercase());
+        }
+    }
+    if let Some(path) = folder_lookup.get(&message.folder_id) {
+        text.push(path.to_ascii_lowercase());
+    }
+    text.join(" ")
+}
 
-        let command = self.parse_command(command)?;
-        let result = pst_pst_pst_core::execute_command(&self.executor, &command, &self.context)?;
-        Ok(UiCommandResult {
-            command_id: 0,
-            exit: false,
-            status: Some("ok".to_string()),
-            payload: Some(UiPayload::Core(result.payload)),
-        })
+fn fields_searchable_text(message: &Message, folder_lookup: &HashMap<FolderId, String>) -> String {
+    let mut text = Vec::new();
+    if let Some(subject) = &message.subject {
+        text.push(subject.to_ascii_lowercase());
+    }
+    if let Some(sender) = &message.sender {
+        if let Some(address) = &sender.address {
+            text.push(address.to_ascii_lowercase());
+        }
+        if let Some(name) = &sender.display_name {
+            text.push(name.to_ascii_lowercase());
+        }
+    }
+    if let Some(body) = &message.body {
+        if let Some(content) = &body.content_ref {
+            text.push(content.to_ascii_lowercase());
+        }
+    }
+    if let Some(path) = folder_lookup.get(&message.folder_id) {
+        text.push(path.to_ascii_lowercase());
+    }
+    text.join(" ")
+}
+
+fn snippet_for_terms(haystack: &str, terms: &[String]) -> Option<String> {
+    for term in terms {
+        if let Some(index) = haystack.find(term) {
+            let start = index.saturating_sub(40);
+            let end = (index + term.len() + 40).min(haystack.len());
+            return Some(haystack[start..end].to_string());
+        }
+    }
+    None
+}
+
+fn index_field_to_core(field: IndexFilterField) -> FilterField {
+    match field {
+        IndexFilterField::Subject => FilterField::Subject,
+        IndexFilterField::Sender => FilterField::Sender,
+        IndexFilterField::Recipient => FilterField::Recipient,
+        IndexFilterField::Folder => FilterField::Folder,
+        IndexFilterField::Body => FilterField::Body,
+        IndexFilterField::HasAttachment => FilterField::HasAttachment,
+        IndexFilterField::Size => FilterField::Size,
+        IndexFilterField::Id => FilterField::Id,
+        IndexFilterField::SentAt => FilterField::SentAt,
+        IndexFilterField::ReceivedAt => FilterField::ReceivedAt,
+        IndexFilterField::ModifiedAt => FilterField::ModifiedAt,
+        IndexFilterField::MessageClass => FilterField::MessageClass,
+        IndexFilterField::Raw(value) => FilterField::Raw(value),
     }
 }
 
-fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand> {
-    let to_shared = |options: &SharedOptions| options.to_core(global.output);
-    let shared = |options: &SharedOptions| options.to_core(global.output);
+fn to_core_command(cli: &Cli, context: &GlobalContext) -> CoreResult<CoreCommand> {
+    let shared = |options: &SharedOptions| -> SharedCommandOptions { options.into_core(context.output) };
     Ok(match &cli.command {
-        CliCommand::Info { source, options } => CoreCommand::Info(InfoCommand {
-            source: source.clone(),
-            options: shared(options),
-        }),
+        CliCommand::Info { source, options } => {
+            CoreCommand::Info(InfoCommand {
+                source: source.clone(),
+                options: shared(options),
+            })
+        }
         CliCommand::Folders {
             source,
             folder,
@@ -1739,7 +1497,7 @@ fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand>
             source,
             folder,
             options,
-        } => CoreCommand::Messages(MessagesCommand {
+        } => CoreCommand::Messages(pst_pst_pst_core::MessagesCommand {
             source: source.clone(),
             folder: folder.clone(),
             options: shared(options),
@@ -1763,6 +1521,21 @@ fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand>
             max_results: *max_results,
             options: shared(options),
         }),
+        CliCommand::Export {
+            source,
+            format,
+            out,
+            folder,
+            message_ids,
+            options,
+        } => CoreCommand::Export(ExportCommand {
+            source: source.clone(),
+            format: format.clone().into_core(),
+            out: Some(out.clone()),
+            folder: folder.clone(),
+            message_ids: message_ids.clone(),
+            options: shared(options),
+        }),
         CliCommand::Extract {
             source,
             message_id,
@@ -1774,21 +1547,6 @@ fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand>
             message_id: message_id.clone(),
             attachment_id: attachment_id.clone(),
             out: Some(out.clone()),
-            options: shared(options),
-        }),
-        CliCommand::Export {
-            source,
-            format,
-            out,
-            folder,
-            message_ids,
-            options,
-        } => CoreCommand::Export(pst_pst_pst_core::ExportCommand {
-            source: source.clone(),
-            format: format.clone().into_core(),
-            out: Some(out.clone()),
-            folder: folder.clone(),
-            message_ids: message_ids.clone(),
             options: shared(options),
         }),
         CliCommand::Validate {
@@ -1820,7 +1578,10 @@ fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand>
             dir: dir.clone(),
             pattern: pattern.clone(),
             on_changed: on_changed.clone(),
-            options: shared(options),
+            options: SharedCommandOptions {
+                strict: false,
+                ..shared(options)
+            },
         }),
         CliCommand::Ui { bind, options } => CoreCommand::Ui(CoreUiCommand {
             bind: bind.clone(),
@@ -1829,36 +1590,65 @@ fn to_core_command(cli: &Cli, global: &GlobalContext) -> CoreResult<CoreCommand>
     })
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let global = match GlobalContext::from_cli(&cli) {
-        Ok(context) => context,
-        Err(error) => {
-            eprintln!("invalid global options: {error}");
-            std::process::exit(exit_code(&error));
-        }
-    };
+fn to_runtime_format(format: CoreExportFormat) -> RuntimeExportFormat {
+    match format {
+        CoreExportFormat::Eml => RuntimeExportFormat::Eml,
+        CoreExportFormat::Mbox => RuntimeExportFormat::Mbox,
+        CoreExportFormat::Json => RuntimeExportFormat::Json,
+        CoreExportFormat::Jsonl => RuntimeExportFormat::Jsonl,
+        CoreExportFormat::Msg => RuntimeExportFormat::Binary,
+    }
+}
 
-    let command = match to_core_command(&cli, &global) {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("invalid command: {error}");
-            std::process::exit(exit_code(&error));
-        }
-    };
+fn to_core_error(message: impl Into<String>) -> CoreError {
+    CoreError::invalid_input(message.into())
+}
 
-    let executor = CliExecutor::new(&global);
-    let context = global.execution_context();
-    match pst_pst_pst_core::execute_command(&executor, &command, &context) {
-        Ok(result) => {
-            if let Err(error) = print_command_result(&result) {
-                eprintln!("render failed: {error}");
-                std::process::exit(exit_code(&error));
+fn map_parser_error(error: ParserError) -> CoreError {
+    match error {
+        ParserError::ProbeIo { path, message } => CoreError::Io {
+            path: Some(path),
+            message: format!("parser I/O while probing source: {message}"),
+            details: Some("failed to read source metadata or probe signature".to_string()),
+        },
+        ParserError::InvalidConfig { path, message } => {
+            CoreError::invalid_input(format!("invalid parser config `{path:?}`: {message}"))
+        }
+        ParserError::UnsupportedContainer { path, requested } => CoreError::unsupported(format!(
+            "unsupported container `{path:?}` for `{requested:?}`",
+        )),
+        ParserError::BackendUnavailable {
+            path,
+            backend_name,
+            message,
+        } => CoreError::Parse {
+            location: None,
+            message: format!("backend `{backend_name}` unavailable for `{path:?}`"),
+            details: Some(message),
+        },
+        ParserError::BackendFailed {
+            path,
+            backend_name,
+            message,
+        } => CoreError::Parse {
+            location: None,
+            message: format!("backend `{backend_name}` failed for `{path:?}`"),
+            details: Some(message),
+        },
+        ParserError::BackendExhausted { path, attempts } => {
+            let details = attempts
+                .into_iter()
+                .map(|attempt| format!(
+                    "{} ({:?}): {}",
+                    attempt.backend_name, attempt.source, attempt.error
+                ))
+                .collect::<Vec<_>>()
+                .join("; ");
+            CoreError::Parse {
+                location: None,
+                message: format!("all parser backends exhausted for `{path:?}`"),
+                details: Some(details),
             }
-        }
-        Err(error) => {
-            eprintln!("command failed: {error}");
-            std::process::exit(exit_code(&error));
         }
     }
 }
@@ -1866,241 +1656,380 @@ fn main() {
 fn print_command_result(result: &CommandResult) -> CoreResult<()> {
     match result.output {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                to_string_pretty(&result.payload)
-                    .map_err(|error| CoreError::invalid_input(format!("failed to render JSON: {error}")))?
-            );
-            Ok(())
+            let text = to_string_pretty(&result.payload)
+                .map_err(|error| CoreError::invalid_input(format!("failed to render json output: {error}")))?;
+            println!("{text}");
         }
         OutputFormat::Jsonl | OutputFormat::Ndjson => {
-            println!(
-                "{}",
-                to_string(&result.payload)
-                    .map_err(|error| CoreError::invalid_input(format!("failed to render JSONL: {error}")))?
-            );
-            Ok(())
+            let text = to_string(&result.payload)
+                .map_err(|error| CoreError::invalid_input(format!("failed to render jsonl output: {error}")))?;
+            println!("{text}");
         }
-        OutputFormat::Table => render_table_payload(&result.payload),
+        OutputFormat::Table => render_table_payload(&result.payload)?,
     }
+    Ok(())
 }
 
 fn render_table_payload(payload: &CommandPayload) -> CoreResult<()> {
     match payload {
         CommandPayload::Mailbox(mailbox) => {
-            println!("mailbox = {}", mailbox.id);
-            println!("source = {}", mailbox.source_path.display());
-            println!("container = {:?}", mailbox.container_format);
-            println!("state = {:?}", mailbox.state);
-            println!("folders = {}", mailbox.folder_count);
-            println!("messages = {}", mailbox.message_count);
-            println!("attachments = {}", mailbox.attachment_count);
-            Ok(())
+            println!("mailbox-id: {}", mailbox.id);
+            println!("source: {}", mailbox.source_path.display());
+            println!("container: {:?}", mailbox.container_format);
+            println!("state: {:?}", mailbox.state);
+            println!("folders: {}", mailbox.folder_count);
+            println!("messages: {}", mailbox.message_count);
+            println!("attachments: {}", mailbox.attachment_count);
         }
         CommandPayload::Folders(result) => {
-            println!("scanned = {}", result.scanned);
+            println!("mailbox: {}", result.mailbox_id);
+            println!("folders: {}", result.scanned);
             for folder in &result.folders {
-                println!(
-                    " - {} [{}] messages={}",
-                    folder.path, folder.id, folder.message_count
-                );
+                println!("{} {}", folder.path, folder.id);
             }
-            println!("has_more = {}", result.page.has_more);
-            Ok(())
+            println!("has_more: {}", result.page.has_more);
         }
         CommandPayload::Messages(result) => {
-            println!("scanned = {}", result.scanned);
-            for message in &result.messages {
-                let subject = message.subject.as_deref().unwrap_or("<no subject>");
-                println!(" - {} {}", message.id, subject);
+            println!("mailbox: {}", result.mailbox_id);
+            println!("messages: {}", result.scanned);
+            if let Some(folder_id) = result.folder_id {
+                println!("folder: {}", folder_id);
             }
-            println!("has_more = {}", result.page.has_more);
-            Ok(())
+            for message in &result.messages {
+                println!("{} {}", message.id, message.subject.clone().unwrap_or_default());
+            }
+            println!("has_more: {}", result.page.has_more);
         }
         CommandPayload::Search(result) => {
             println!(
-                "hits = {} returned = {} source_mode = {:?}",
-                result.total, result.returned, result.source_mode
+                "mailbox={} mode={:?} total={} returned={}",
+                result.mailbox_id,
+                result.source_mode,
+                result.total,
+                result.hits.len()
             );
             for hit in &result.hits {
-                println!(
-                    " - {} score = {:?} source = {:?} folder = {}",
-                    hit.message_id, hit.score, hit.match_source, hit.folder_id
-                );
+                println!("{} {:?} {:?}", hit.message_id, hit.folder_id, hit.match_source);
             }
-            Ok(())
+            println!("returned: {}", result.returned);
+            println!("has_more: {}", result.page.has_more);
         }
         CommandPayload::Export(result) => {
-            println!("requested = {}", result.requested);
-            println!("exported = {}", result.exported);
-            println!("skipped = {}", result.skipped);
-            println!("failed = {}", result.failed);
-            println!("destination = {}", result.destination.display());
-            Ok(())
+            println!("requested={}", result.requested);
+            println!("exported={}", result.exported);
+            println!("skipped={}", result.skipped);
+            println!("failed={}", result.failed);
+            println!("destination={}", result.destination.display());
         }
         CommandPayload::Validation(result) => {
-            println!("passed = {}", result.passed);
-            println!("scanned_items = {}", result.scanned_items);
-            println!("warnings = {}", result.warnings);
-            println!("errors = {}", result.errors);
-            Ok(())
+            println!("mailbox={} passed={}", result.mailbox_id, result.passed);
+            println!("scanned_items={}", result.scanned_items);
+            println!("warnings={}", result.warnings);
+            println!("errors={}", result.errors);
         }
         CommandPayload::Index(result) => {
-            println!("mailbox = {:?}", result.mailbox_id);
-            println!("documents = {}", result.documents);
-            println!("segments = {}", result.segments);
-            println!("policy = {:?}", result.policy);
-            println!("mode = {:?}", result.mode);
-            Ok(())
+            println!(
+                "mailbox={:?} documents={} segments={} deterministic={}",
+                result.mailbox_id, result.documents, result.segments, result.deterministic
+            );
+            println!("policy={:?} mode={:?}", result.policy, result.mode);
         }
         CommandPayload::Watch(result) => {
-            println!("watch_dir = {}", result.watched_dir.display());
-            println!("matched_files = {}", result.matched_files);
-            println!("processed_events = {}", result.processed_events);
-            println!("failed = {}", result.failed);
-            if let Some(last_error) = &result.last_error {
-                println!("last_error = {last_error}");
+            println!("dir={}", result.watched_dir.display());
+            println!("matched_files={}", result.matched_files);
+            println!("processed_events={}", result.processed_events);
+            println!("failed={}", result.failed);
+            if let Some(error) = &result.last_error {
+                println!("last_error={error}");
             }
-            Ok(())
         }
         CommandPayload::Ui(result) => {
-            println!(
-                "session = {} started={} bind={}",
-                result.session_id, result.started, result.bind
-            );
-            Ok(())
+            println!("session={} bind={}", result.session_id, result.bind);
+            println!("started={}", result.started);
         }
+    }
+    Ok(())
+}
+
+struct CliUiBus {
+    executor: CliExecutor,
+    bind_source: String,
+}
+
+impl CliUiBus {
+    fn new(executor: CliExecutor, bind_source: String) -> Self {
+        Self {
+            executor,
+            bind_source,
+        }
+    }
+}
+
+impl UiCommandBus for CliUiBus {
+    type Error = CoreError;
+
+    fn execute(
+        &mut self,
+        _state: &pst_pst_pst_ui::UiState,
+        command: &UiShellCommand,
+    ) -> Result<UiCommandResult, Self::Error> {
+        if let UiCommandKind::Quit = command.kind {
+            return Ok(UiCommandResult {
+                command_id: 0,
+                exit: true,
+                status: Some("bye".to_string()),
+                payload: Some(UiPayload::Text("bye".to_string())),
+            });
+        }
+        if matches!(command.kind, UiCommandKind::Help) {
+            return Ok(UiCommandResult {
+                command_id: 0,
+                exit: false,
+                status: Some("help".to_string()),
+                payload: Some(UiPayload::Text(
+                    "commands: info folders messages search extract export validate index watch quit".to_string(),
+                )),
+            });
+        }
+
+        let core = map_ui_to_core(command, &self.bind_source)?;
+        let context = ExecutionContext {
+            runtime: RuntimeExecutionConfig {
+                jobs: 1,
+                io_jobs: 1,
+                cpu_jobs: 1,
+                single_thread: true,
+                strict: false,
+                include_unindexed: true,
+                index_staleness_threshold: None,
+            },
+            output: OutputFormat::Table,
+            deterministic: true,
+            strict: false,
+        };
+        let result = pst_pst_pst_core::execute_command(&self.executor, &core, &context)?;
+        Ok(UiCommandResult {
+            command_id: 0,
+            exit: false,
+            status: Some("ok".to_string()),
+            payload: Some(UiPayload::Core(result.payload)),
+        })
+    }
+}
+
+fn map_ui_to_core(command: &UiShellCommand, bind_source: &str) -> CoreResult<CoreCommand> {
+    let shared = SharedCommandOptions {
+        filter: Vec::new(),
+        output: OutputFormat::Table,
+        limit: None,
+        sort: None,
+        deterministic: true,
+        strict: false,
+        page_token: None,
+    };
+
+    let args = &command.args;
+    let with_base_source = |selector: Option<&String>| -> PathBuf {
+        selector
+            .map(PathBuf::from)
+            .filter(|path| path.as_os_str().is_empty() == false)
+            .unwrap_or_else(|| PathBuf::from(bind_source))
+    };
+
+    match command.kind {
+        UiCommandKind::Info => Ok(CoreCommand::Info(InfoCommand {
+            source: args.first().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(bind_source)),
+            options: shared.clone(),
+        })),
+        UiCommandKind::Folders => {
+            let source = with_base_source(args.first());
+            let folder = if args.len() > 1 { Some(args[1].clone()) } else { None };
+            Ok(CoreCommand::Folders(pst_pst_pst_core::FoldersCommand {
+                source,
+                folder,
+                options: shared,
+            }))
+        }
+        UiCommandKind::Messages => {
+            let source = with_base_source(args.first());
+            let folder = if args.len() > 1 { Some(args[1].clone()) } else { None };
+            Ok(CoreCommand::Messages(pst_pst_pst_core::MessagesCommand {
+                source,
+                folder,
+                options: shared,
+            }))
+        }
+        UiCommandKind::Search => {
+            if args.is_empty() {
+                return Err(to_core_error("search expects a query"));
+            }
+            let source = with_base_source(args.first());
+            let query_offset = if Path::new(&source).exists() { 1 } else { 0 };
+            let query = args[query_offset..].join(" ");
+            if query.trim().is_empty() {
+                return Err(to_core_error("search expects a query"));
+            }
+            Ok(CoreCommand::Search(SearchCommand {
+                source,
+                query,
+                fields: Vec::new(),
+                mode: SearchMode::Auto,
+                index_policy: IndexPolicy::Allow,
+                include_unindexed: true,
+                max_results: None,
+                options: shared,
+            }))
+        }
+        UiCommandKind::Extract => {
+            if args.is_empty() {
+                return Err(to_core_error("extract expects a message id or attachment id"));
+            }
+            let (source, first, second) = if args.len() == 1 {
+                (PathBuf::from(bind_source), Some(&args[0]), None)
+            } else {
+                (
+                    PathBuf::from(&args[0]),
+                    args.get(1),
+                    args.get(2),
+                )
+            };
+            Ok(CoreCommand::Extract(pst_pst_pst_core::ExtractCommand {
+                source,
+                message_id: first.map(|value| value.clone()),
+                attachment_id: second.cloned(),
+                out: Some(PathBuf::from(".")),
+                options: shared,
+            }))
+        }
+        UiCommandKind::Export => {
+            if args.len() < 2 {
+                return Err(to_core_error("export expects: <source> <out> [message-id...]"));
+            }
+            Ok(CoreCommand::Export(ExportCommand {
+                source: PathBuf::from(&args[0]),
+                format: CoreExportFormat::Jsonl,
+                out: Some(PathBuf::from(&args[1])),
+                folder: None,
+                message_ids: args[2..].to_vec(),
+                options: shared,
+            }))
+        }
+        UiCommandKind::Validate => {
+            let source = with_base_source(args.first());
+            Ok(CoreCommand::Validate(ValidateCommand {
+                source,
+                report: None,
+                options: shared,
+            }))
+        }
+        UiCommandKind::Index => {
+            let source = with_base_source(args.first());
+            Ok(CoreCommand::Index(IndexCommand {
+                source,
+                db: None,
+                rebuild: false,
+                options: shared,
+            }))
+        }
+        UiCommandKind::Watch => {
+            let dir = with_base_source(args.first());
+            Ok(CoreCommand::Watch(WatchCommand {
+                dir,
+                pattern: None,
+                on_changed: args.get(1).cloned().unwrap_or_else(|| "echo {path}".to_string()),
+                options: shared,
+            }))
+        }
+        UiCommandKind::Unknown(_) => Err(to_core_error("unknown UI command")),
+        _ => Err(to_core_error("unsupported UI command")),
     }
 }
 
 fn discover_files(base: &Path, pattern: &str) -> CoreResult<HashMap<PathBuf, u64>> {
-    if !base.exists() {
+    if !base.is_dir() {
         return Err(CoreError::io(
             Some(base.to_path_buf()),
-            "watch directory does not exist",
+            "watch path must be a directory",
         ));
     }
-
-    let mut candidates = HashSet::new();
-    let mut map = HashMap::new();
-    let entries = fs::read_dir(base).map_err(|error| {
-        CoreError::io(
-            Some(base.to_path_buf()),
-            format!("failed to enumerate watch directory: {error}"),
-        )
-    })?;
-
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| CoreError::io(Some(base.to_path_buf()), format!("failed to read dir entry: {error}")))?;
+    let mut discovered = HashMap::new();
+    for entry in std::fs::read_dir(base)
+        .map_err(|error| CoreError::io(Some(base.to_path_buf()), format!("read dir failed: {error}")))? {
+        let entry = entry.map_err(|error| CoreError::io(Some(base.to_path_buf()), format!("dir entry failed: {error}")))?;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        let file = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-        if !matches_pattern(file, pattern) {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches_pattern(&file_name, pattern) {
             continue;
         }
-        if !candidates.insert(path.clone()) {
-            continue;
-        }
-        let metadata = entry.metadata().map_err(|error| {
-            CoreError::io(
-                Some(path.clone()),
-                format!("failed to read metadata: {error}"),
-            )
-        })?;
-        let modified = metadata.modified().ok().and_then(|value| {
-            value
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|duration| duration.as_secs())
-        });
-        map.insert(path, modified.unwrap_or(0));
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        discovered.insert(path, mtime);
     }
-    Ok(map)
+    Ok(discovered)
 }
 
 fn matches_pattern(file_name: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim();
-    if pattern.is_empty() || pattern == "*" {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern == "*" || pattern.is_empty() {
         return true;
     }
-    if pattern.starts_with("*.") && pattern.matches('*').count() == 1 {
-        let extension = pattern.trim_start_matches("*.");
-        file_name
-            .rsplit('.')
-            .next()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case(extension));
-        return file_name
-            .to_ascii_lowercase()
-            .ends_with(&pattern.to_ascii_lowercase().trim_start_matches('*'));
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        let ext = format!(".{ext}");
+        return file_name.ends_with(&ext);
+    }
+    if pattern.ends_with('*') {
+        return file_name.starts_with(&pattern.trim_end_matches('*'));
     }
     if pattern.starts_with('*') {
-        let suffix = pattern.trim_start_matches('*');
-        file_name
-            .to_ascii_lowercase()
-            .ends_with(&suffix.to_ascii_lowercase())
-    } else if pattern.ends_with('*') {
-        let prefix = pattern.trim_end_matches('*');
-        file_name
-            .to_ascii_lowercase()
-            .starts_with(&prefix.to_ascii_lowercase())
-    } else {
-        file_name
-            .to_ascii_lowercase()
-            .eq_ignore_ascii_case(&pattern.to_ascii_lowercase())
+        return file_name.ends_with(&pattern.trim_start_matches('*'));
     }
+    file_name == pattern
 }
 
 fn render_on_changed_template(command: &str, path: &Path) -> String {
     command
-        .replace("{path}", &path.display().to_string())
-        .replace("{dir}", path.parent().unwrap_or(Path::new("")).display().to_string().as_str())
+        .replace("{path}", path.display().to_string().as_str())
+        .replace("{dir}", path.parent().unwrap_or(Path::new(".")).display().to_string().as_str())
 }
 
-fn run_on_changed(command: &str) -> CoreResult<()> {
+fn run_on_changed(raw_command: &str) -> CoreResult<()> {
     let status = if cfg!(windows) {
         ShellCommand::new("cmd")
-            .args(["/C", command])
+            .args(["/C", raw_command])
             .status()
+            .map_err(|error| CoreError::io(None, format!("watch command failed: {error}")))?
     } else {
         ShellCommand::new("sh")
-            .args(["-c", command])
+            .args(["-c", raw_command])
             .status()
-    }
-    .map_err(|error| CoreError::io(None, format!("failed to run hook: {error}")))?;
-
+            .map_err(|error| CoreError::io(None, format!("watch command failed: {error}")))?
+    };
     if status.success() {
         Ok(())
     } else {
-        Err(CoreError::invalid_input(format!("hook failed with {status}")))
+        Err(CoreError::invalid_input(format!(
+            "watch command failed with status {status}"
+        )))
     }
 }
 
-fn map_parser_error(error: ParserError) -> CoreError {
-    match error {
-        ParserError::ProbeIo { path, message } => CoreError::io(Some(path), message),
-        ParserError::UnsupportedContainer { path, .. } => CoreError::unsupported(format!(
-            "unsupported container for source `{path}`"
-        )),
-        ParserError::BackendUnavailable { path, backend_name, message } => {
-            CoreError::unsupported(format!("backend `{backend_name}` unavailable for `{path}`: {message}"))
-        }
-        ParserError::BackendFailed { path, backend_name, message } => {
-            CoreError::parse(format!("backend `{backend_name}` failed for `{path}`: {message}"))
-        }
-        ParserError::InvalidConfig { path, message } => {
-            CoreError::invalid_input(format!("invalid parser config for `{path}`: {message}"))
-        }
-        ParserError::BackendExhausted { path, attempts } => {
-            CoreError::parse(format!("all parser backends failed for `{path}`: {attempts:?}"))
-        }
-    }
-}
-
-fn map_index_error(error: CoreError) -> CoreError {
-    error
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn exit_code(error: &CoreError) -> i32 {
@@ -2117,3 +2046,41 @@ fn exit_code(error: &CoreError) -> i32 {
     }
 }
 
+fn main() {
+    let cli = Cli::parse();
+    let context = match GlobalContext::from_cli(&cli) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("invalid args: {error}");
+            std::process::exit(exit_code(&error));
+        }
+    };
+
+    let command = match to_core_command(&cli, &context) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("invalid command: {error}");
+            std::process::exit(exit_code(&error));
+        }
+    };
+
+    if let Err(error) = command.validate() {
+        eprintln!("invalid command input: {error}");
+        std::process::exit(exit_code(&error));
+    }
+
+    let executor = CliExecutor::new(&context);
+    let execution = context.execution_context();
+    match pst_pst_pst_core::execute_command(&executor, &command, &execution) {
+        Ok(result) => {
+            if let Err(error) = print_command_result(&result) {
+                eprintln!("rendering failed: {error}");
+                std::process::exit(exit_code(&error));
+            }
+        }
+        Err(error) => {
+            eprintln!("command failed: {error}");
+            std::process::exit(exit_code(&error));
+        }
+    }
+}

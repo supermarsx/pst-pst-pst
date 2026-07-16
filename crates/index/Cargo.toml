@@ -2,9 +2,10 @@
 name = "pst-pst-pst-index"
 version = "0.1.0"
 edition = "2021"
-description = "Placeholder index crate for future indexing interfaces."
+description = "Native high-performance indexing and query planning for pst-pst-pst."
 license = "MIT"
 rust-version = "1.70"
 
 [dependencies]
 pst-pst-pst-core = { path = "../core" }
+rayon = "1.10"

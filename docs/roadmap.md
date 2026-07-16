@@ -1,7 +1,7 @@
 # pst-pst-pst Roadmap
 
 Source of truth:
-This roadmap is derived from `spec.md` and `README.md`.
+This roadmap is derived from `spec.md` and `readme.md`.
 
 ## Objectives and non-negotiables
 
@@ -9,7 +9,7 @@ This roadmap is derived from `spec.md` and `README.md`.
 - Multithreaded-by-default: all heavy CPU/I/O paths run in bounded parallel workers unless `--single-thread` is set.
 - Search parity: CLI and UI expose `full`, `indexed`, `hybrid`, and `auto` modes with the same schema and behavior.
 - Native-only safety: local-first processing, read-only source handling by default, deterministic outputs when requested.
-- License: MIT.
+- license: MIT.
 
 ## Phased roadmap
 
@@ -155,3 +155,4 @@ This roadmap is derived from `spec.md` and `README.md`.
 - Phase 3 adds deterministic export and automation, closing the data-out path.
 - Phase 4 ensures investigation UX reaches CLI parity.
 - Phase 5 executes final quality gates for production release.
+

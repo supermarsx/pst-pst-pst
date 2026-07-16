@@ -1,307 +1,303 @@
 # Specification: `pst-pst-pst`
 
-## 0) Purpose
+## 0. Vision and scope
 
-`pst-pst-pst` is a high-performance, native Rust application for reading and working with Outlook storage files:
+`pst-pst-pst` is a high-performance Rust-native platform for ingesting and operating on Outlook container formats (`.pst`, `.ost`, `.msg`) through one shared execution contract. It provides:
 
-- `.pst`
-- `.ost`
-- `.msg`
+- A scriptable CLI (`pst-pst-pst`).
+- A terminal-native interactive shell surface (`pst-pst-pst ui`) using the same command contracts.
+- Native parser/index/export behavior with no FFI in core paths.
+- Multi-threading for heavy CPU and I/O operations by default.
 
-The project provides:
+The intended operators are digital examiners, security teams, SREs, and automation teams that need predictable offline mailbox analysis.
 
-- a machine-friendly CLI (`pst-pst-pst`)
-- a native desktop UI shell
-- parity for parsing, filtering, search semantics, and export behavior across both surfaces
+## 1. Non-negotiable requirements
 
-This specification is the canonical definition for v1 implementation.
+### 1.1 License and distribution
 
-## 1) Hard constraints (MUST)
+- The project is released under the MIT license (`license`).
+- All crates and tooling artifacts inherit this licensing and include license notices where distribution outputs are produced.
 
-### 1.1 License and policy
+### 1.2 No-FFI policy
 
-- The project is MIT-licensed.
-- Public artifacts and contributions are governed by the repository `LICENSE`.
+- There must be no hard dependency on COM, MAPI, proprietary runtime SDKs, or runtime bridge crates in parser/index/export/search execution.
+- Native code paths must remain pure Rust at runtime.
+- FFI-adjacent crates are only allowed if they do not participate in runtime execution and are gated for non-production tooling.
+- Build/test workflows must be able to validate policy conformance.
 
-### 1.2 No FFI policy
+### 1.3 Cross-platform correctness
 
-- Parsing, indexing, search, and export logic in runtime path must be Rust-native.
-- No mandatory `*-sys`, COM, Outlook SDK, or wrapper-based dynamic native dependencies in core flows.
-- CLI/UI and parser contracts must remain buildable with pure Rust dependencies.
+- Supported hosts: Windows, macOS, Linux.
+- Binary behavior must remain deterministic across hosts for equivalent inputs, options, and data.
+- Any host-specific fallback behavior is explicit and documented.
 
-### 1.3 Platform
+### 1.4 Multi-threading baseline
 
-- Cross-platform support is required for Linux, Windows, and macOS.
-- Build and run behavior must be deterministic across supported platforms.
+- All compute-heavy and I/O-heavy stages run through thread pools by default.
+- `--single-thread` disables parallel scheduling and forces serial deterministic execution for diagnosability.
 
-### 1.4 Performance baseline
+### 1.5 Concurrency safety
 
-- Parallel execution is required by default for heavy compute and I/O stages.
-- `--single-thread` must provide a deterministic serial fallback.
-- Defaults for job sizing must be configurable and bounded.
+- All public task runners for index/search/export expose `Send + Sync` constraints.
+- Shared states use message passing or lock-safe structures.
+- Bounded backpressure is required where work can outpace consumers.
 
-### 1.5 Naming conventions
+### 1.6 Filename hygiene
 
-- Crate names use `pst-pst-pst-*` naming.
-- Source/manifest filenames are lower-case where practical.
-- Export/index artifacts should default to lower-case naming and stable extension conventions.
+- New file and directory outputs use lower-case naming patterns where practical.
+- Repository documentation filenames are lower-case by convention (`spec.md`, `docs/*.md`).
 
-## 2) Architecture
+## 2. System architecture
 
-The workspace is split into five layers:
+### 2.1 Domain layers
 
-1. `crates/core`
-   - command contracts
-   - shared domain types
-   - result payloads and error taxonomy
-2. `crates/parser`
-   - backend registry and container discovery
-   - pst/ost/msg extraction contracts
-3. `crates/index`
-   - index build interfaces
-   - search query/result metadata
-4. `crates/export`
-   - export payload contracts
-   - checkpoints/progress/chunk scheduling
-5. `crates/cli` and `crates/ui`
-   - user interfaces
-   - parser/index/export orchestration
+1. **CLI layer** (`crates/cli`) parses commands and delegates into shared application services.
+2. **Core layer** (`crates/core`) defines stable contracts, identifiers, commands, outputs, and typed errors.
+3. **Parser layer** (`crates/parser`) normalizes container contents into `ParsedStore` models.
+4. **Index layer** (`crates/index`) builds searchable structures and query plans.
+5. **Export layer** (`crates/export`) performs deterministic materialization to common mailbox formats.
+6. **UI layer** (`crates/ui`) exposes terminal interactive state synchronized with CLI behavior.
 
-## 3) Parsing contract
+### 2.2 Cross-layer contract
 
-### 3.1 File detection and backend selection
+All layers must preserve these invariants:
 
-1. Detect file type by:
-   - extension
-   - OLE/compound signature checks
-2. If requested container is specified, prefer that backend.
-3. If not specified, use confidence-based probe with fallback candidates.
-4. On mismatch and fallback disabled: return typed unsupported container error.
+- A command submitted by UI or CLI maps to a single core command schema.
+- Search and export results carry a stable schema across transport surfaces.
+- Every non-trivial command returns enough metadata to support retry, reproducibility, and auditing.
+- Every command returns a typed completion signal plus per-category error classes.
 
-### 3.2 Backend requirements
+## 3. Parser requirements (PST/OST/MSG)
 
-- `.pst` and `.ost` containers are parsed by the same underlying local parser strategy, with format-aware branching.
-- `.msg` uses Rust-native message parser path.
-- Backend errors are mapped into:
-  - I/O parse errors
-  - per-item decode errors
-  - recoverable/continuable item errors
-- Parsing must produce:
-  - `Mailbox`
-  - `Folder` tree
-  - `Message`
-  - `Attachment`
-  - `ParseEvent` stream
+### 3.1 Input discovery and backend selection
 
-### 3.3 Recovery behavior
+1. Input is discovered from extension and signature.
+2. Backend candidates are generated with confidence scores.
+3. The backend with strongest confidence is selected unless unsupported/ambiguous.
+4. Unsupported formats terminate with typed error (`unsupported` category).
 
-- Non-fatal item corruption must produce a warning event and continue traversal.
-- A strict mode is optional and aborts according to configured policy.
-- Parse summary includes:
-  - recovered item count
-  - fatal count
-  - elapsed durations
-  - event list
+Supported container mappings:
 
-## 4) Multi-threading model
+- `.pst` -> PST backend
+- `.ost` -> OST backend
+- `.msg` -> MSG backend
 
-### 4.1 Pipeline stages
+### 3.2 Parsing behavior
 
-1. Discovery stage
-2. Decode stage
-3. Normalize stage (body, recipients, metadata)
-4. Index/scan stage
-5. Export/export-checkpoint stage
+- Parse output is normalized into shared core types (`Mailbox`, `Folder`, `Message`, `Attachment`, `ParseEvent`).
+- Parsing MUST be incremental and recoverable:
+  - Non-fatal item/corruption errors become warnings.
+  - Strictness mode controls when recoverables are escalated to terminal errors.
+- Metadata extraction MUST include IDs, subject, sender/recipients, timestamps, sizes, and folder path when available.
 
-### 4.2 Resource controls
+### 3.3 Synthetic parse behavior
 
-- `--jobs` defines global worker budget.
-- `--io-jobs` limits filesystem read/write workers.
-- `--cpu-jobs` limits decode/index workers.
-- `--single-thread` collapses to one worker in each stage.
+When a container is valid but partially unknown, parser MAY emit synthetic diagnostics and synthetic records according to implemented strategy, as long as provenance is explicit in outputs.
 
-### 4.3 Deterministic behavior
+### 3.4 Output and recovery constraints
 
-- Concurrent output must be ordered deterministically when `--deterministic` is set.
-- Stable sort/tie-breaker requirements:
-  - primary key: message ID
-  - secondary key: source order within parse chunk
-  - deterministic cursor across resume boundaries
+- Parser outputs must include parse telemetry and event streams.
+- Parse telemetry must distinguish warning/fatal and preserve fault context fields.
+- If strict mode is enabled, recoverable faults may still fail according to command policy.
 
-### 4.4 Backpressure
+## 4. Search and query contract
 
-- All asynchronous producer-consumer paths use bounded buffers.
-- Memory pressure is controlled by:
-  - bounded queues
-  - bounded batch sizes
-  - periodic checkpointing
+Search in this system is designed as a spectrum from low-latency index paths to exact full scans.
 
-## 5) Search contract (“everything in between”)
+### 4.1 Modes
 
-The product must support both indexed and non-indexed strategies with explicit provenance.
+#### full
+- Scan parsed records only.
+- Guarantees no index precondition.
+- Highest correctness under incomplete index state.
 
-### 5.1 Modes
+#### indexed
+- Query against prebuilt search records only.
+- Requires index availability and configured freshness.
+- Lowest latency when healthy.
 
-`full`, `indexed`, `hybrid`, `auto` are first-class.
+#### hybrid
+- Use index candidate generation.
+- Verify candidate hits through full-content checks.
+- Return mode and source metadata for each hit.
 
-- `full`: direct scan only, no index dependency.
-- `indexed`: query persisted index only.
-- `hybrid`: indexed candidate list + final verification scan.
-- `auto`: planner selects strategy based on index validity, staleness, and policy.
+#### auto
+- Planner chooses mode based on:
+  - requested mode constraints,
+  - index policy,
+  - freshness,
+  - include_unindexed flag,
+  - resource profile.
 
-### 5.2 Index policy
+### 4.2 Planner semantics
 
-- `allow`: prefer index, fallback according to planner.
-- `require`: return explicit error when index is missing or stale.
-- `build`: run/prepare index before query when needed.
-- `refresh`: refresh stale index, then execute query.
+The planner MUST expose effective mode in result metadata. Auto-planning rules include:
 
-### 5.3 Search output contract
+1. If `--search-mode full`, effective mode is always full.
+2. If `--search-mode indexed`, require policy pass or fail fast.
+3. If `--search-mode hybrid`, return hybrid when index is present; degrade to full only when explicitly allowed.
+4. If `--search-mode auto` and index policy is:
+   - `require`: must use index and fail if unavailable or stale.
+   - `allow`: use index when valid, otherwise full.
+   - `build`: build missing/invalid index before execution.
+   - `refresh`: rebuild/refresh stale index and continue.
 
-All modes return a unified schema:
+### 4.3 Query model
 
-- `SearchResult`
-  - `mailbox_id`
-  - `hits[]`
-  - `total`
-  - `returned`
-  - `query`
-  - `source_mode`
-  - `include_unindexed`
-  - `deterministic`
-  - `page`
-- each hit includes:
-  - `message_id`
-  - `folder_id`
-  - `score`
-  - `match_source` (`full`, `indexed`, `hybrid`)
-  - `matched_fields`
-  - optional `snippet`
+- Query parsing MUST be deterministic with clear error positions on invalid expressions.
+- Query language includes field-level operations and boolean composition.
+- Result ranking is deterministic in `--deterministic` mode using stable tie-breakers.
 
-### 5.4 Acceptance matrix
+### 4.4 Full-text + indexed parity
 
-- `full` must succeed without index artifacts.
-- `indexed` must enforce `--index-policy` for missing/stale index.
-- `hybrid` must confirm matches through scan pass for candidate verification.
-- `auto` must never produce incorrect mode claim in output.
+Both search paths must emit the same result schema and metadata fields. If a hit path differs in source, this is explicit via `match_source` and `source_mode` fields. Hybrid mode must preserve correctness against indexed mode by verifying candidates.
 
-## 6) Export contract
+## 5. Index model
 
-### 6.1 Formats
+### 5.1 Document model
+
+Index documents represent message-level entities with fields:
+
+- identity fields: mailbox, folder, message IDs
+- contact fields: sender, recipients, cc/bcc, subject
+- temporal fields: received, sent, created
+- content fields: subject, body, attachment names
+- metadata fields: size, has_attachment, flags, hash, version markers
+
+### 5.2 Build behavior
+
+- Builds support incremental updates, idempotent upsert semantics, and deterministic ordering controls.
+- Builders use parallel workers when message volume justifies partitioned execution.
+- Build state must be observable (`queued`, `running`, `done`, `failed`) and include elapsed wall time.
+
+### 5.3 Storage and checkpointing
+
+- Indexes are persisted with generation metadata and optional build fingerprint.
+- Stale indexes are detected and handled via policy (`refresh`/`require`/`build`).
+- Checkpoint artifacts must identify source and build identity.
+
+### 5.4 Query execution
+
+- Query execution can parallelize by shard/candidate-set partitioning in non-deterministic mode.
+- Deterministic mode disables non-stable ordering and enforces canonical tie-breakers.
+
+## 6. Export contract
+
+### 6.1 Supported targets
 
 - `eml`
 - `mbox`
 - `json`
 - `jsonl`
 
-### 6.2 Behavioral requirements
+### 6.2 Export semantics
 
-- safe path resolution (no traversal escape)
-- deterministic naming with `--deterministic`
-- resumable progress via checkpoints
-- attachment handling through digest-based dedupe when enabled
-- manifest includes completed/skipped/failed summary
+- Export command MUST produce deterministic naming and ordering when `--deterministic` is active.
+- Exports for repeated runs on unchanged input SHOULD be idempotent in deterministic mode.
+- Export manifest contains run status (`requested`, `completed`, `skipped`, `failed`) and strictness mode.
 
-## 7) CLI behavior
+### 6.3 Safety requirements
 
-### 7.1 Required command set
+- Output path resolution is canonical and bounded to destination root.
+- Attachment filenames are sanitized.
+- Partial writes must never corrupt completed artifacts.
 
-- `info`
-- `folders`
-- `messages`
-- `search`
-- `extract`
-- `export`
-- `validate`
-- `index`
-- `watch`
-- `ui`
+## 7. CLI contract and output behavior
 
-### 7.2 Command output behavior
+### 7.1 Global CLI contract
 
-- `table`: terminal presentation.
-- `json`/`jsonl`/`ndjson`: machine format for automation.
-- exit status must reflect command outcome category (`parse`, `io`, `index`, `export`, etc.).
+- Commands and outputs are stable and typed.
+- Output channels:
+  - table (human)
+  - json
+  - jsonl/ndjson (streaming)
+- Exit codes map to command category and failure class.
 
-### 7.3 Filter language parity
+### 7.2 Core commands
 
-- Query parser is shared across CLI/UI.
-- Unsupported expressions produce actionable parse errors with location/cursor context.
+- `info`, `folders`, `messages`, `search`, `extract`, `export`, `validate`, `index`, `watch`, `ui`.
+- UI must support the same semantic defaults as CLI.
 
-## 8) UI behavior contract
+### 7.3 Validation and diagnostics
 
-- Folder tree and message list navigation.
-- Message and body preview.
-- Search bar with selectable mode (`auto|full|indexed|hybrid`).
-- Export action queue with cancel/retry semantics.
-- Real-time progress and diagnostics channel.
-- Shared command vocabulary with CLI.
+- Strict and non-strict modes are explicit per command and exported in command metadata.
+- Error diagnostics include domain category and actionable hints where possible.
 
-## 9) Data and error model
+## 8. UI contract
 
-- Errors follow `CoreError` taxonomy:
-  - `Io`
-  - `Parse`
-  - `Decode`
-  - `Integrity`
-  - `Index`
-  - `Export`
-  - `Ui`
-  - `Unsupported`
-- Parse events are structured and persistable.
-- Strict mode and recovery mode are explicitly surfaced.
+### 8.1 Shared command schema
 
-## 10) Non-goals
+- UI emits the same command identifiers and payload shape as CLI.
+- Query/search filter representation is compatible with CLI parser semantics.
 
-- No Outlook/cloud account management.
-- No write-modify operations on source files.
-- No mandatory external runtime dependency outside Rust ecosystem.
-- No COM or native desktop automation as required pipeline input.
+### 8.2 UX requirements
 
-## 11) Quality and acceptance targets
+- Non-blocking input and update loop.
+- Progress events for long jobs.
+- Reusable session state and command history.
+- No external UI runtime dependency beyond native terminal execution layer.
 
-### 11.1 Reliability
+## 9. Concurrency and performance requirements
 
-- Partial failures must be reported, not silently dropped.
-- Corrupt nodes/messages continue when possible.
-- Deterministic and strict modes are explicitly tested.
+### 9.1 Throughput
 
-### 11.2 Performance
+- Default concurrency must scale with CPU core count while avoiding starvation.
+- I/O and CPU budgets must be independently tunable.
+- Index/search pipelines should maintain stable throughput under large container sets.
 
-- Throughput improvements expected from concurrency and bounded scheduling.
-- Interaction latency targets are enforced in UI profile checks.
-- Memory footprint bounded through queue limits and streaming pipelines.
+### 9.2 Resource control
 
-### 11.3 Verification
+- Use bounded queues for producer/consumer stages.
+- Track backpressure and cap in-memory materialization where practical.
+- Large attachment and body reads should use streaming or bounded chunking.
 
-- Unit tests for core domain and query types.
-- Integration tests for sample `.pst`, `.ost`, `.msg` fixtures.
-- Benchmark gates for parse/index/search regression.
-- Search parity tests across modes and policy combinations.
+### 9.3 Reproducibility targets
 
-## 12) Milestones
+- `--deterministic` mode must produce stable ordering and stable pagination tokens across runs.
+- Deterministic mode applies to indexing, search ranking, export pathing, and report summaries.
 
-### Milestone 1: foundation
+## 10. Error and telemetry model
 
-- CLI and parser bootstrap wired
-- no-FFI and policy enforcement implemented
+All commands use typed error classes:
 
-### Milestone 2: command parity
+- IO
+- Parse
+- Decode
+- Integrity
+- Index
+- Export
+- UI
+- Unsupported
+- InvalidInput
 
-- `info`, `folders`, `messages`, `validate`, `search`
-- strict and deterministic modes
+Each class SHOULD map to structured terminal and machine output. Telemetry includes operation ID, command, source, and resource profile.
 
-### Milestone 3: index/search
+## 11. Security model
 
-- indexed and hybrid search available
-- planner + policy controls implemented
+- No credential extraction or secret persistence.
+- No implicit writes to source containers.
+- No mutation of source by default.
+- Export path controls prevent directory traversal and symlink attacks where practical.
 
-### Milestone 4: export + watch
+## 12. Acceptance criteria
 
-- export checkpoints and manifests
-- watch automation and durable command handling
+### 12.1 Functional
 
-### Milestone 5: UI parity
+- `info`, `folders`, `messages`, `search`, `extract`, `export`, `validate`, `index`, `watch`, `ui` are command-present with shared contract behavior.
+- `.pst`, `.ost`, `.msg` paths are resolved and mapped correctly by backend selection.
+- Search planner output reports effective mode and match source for each hit.
+- Full/indexed/hybrid/auto modes produce coherent and auditable result schema.
+- Export manifest and report outputs are always parseable.
 
-- native shell parity for CLI command set and search schema
-- progress, diagnostics, and deterministic execution paths
+### 12.2 Non-functional
+
+- No-FFI remains true in runtime path across parser/index/export.
+- Multithreading defaults are used on all non-trivial runs.
+- Deterministic mode yields stable, replayable ordering.
+- Performance remains bounded and degrades predictably under stress.
+
+## 13. Release and operations hardening
+
+- Documentation (`README`, `spec`, roadmap, checklist) must stay in sync with implementation status.
+- CI and packaging should validate dependency policy and platform matrix.
+- Performance and correctness tests should include malformed containers and large corpora.

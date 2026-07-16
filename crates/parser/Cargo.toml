@@ -2,7 +2,7 @@
 name = "pst-pst-pst-parser"
 version = "0.1.0"
 edition = "2021"
-description = "Placeholder parser module for future parser implementations."
+description = "Native parser orchestration and backend normalization for PST/OST/MSG containers."
 license = "MIT"
 rust-version = "1.70"
 

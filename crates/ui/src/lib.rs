@@ -1,12 +1,24 @@
 //! Terminal-oriented UI primitives for command dispatch, state, and rendering.
 //! This crate provides lightweight contracts and helper implementations with
 //! optional rich/plain output.
+//!
+//! Contract:
+//! - Native-Rust only: no mandatory FFI dependency surface and no `unsafe` blocks.
+//! - UI runtime and payload types are designed for multithreaded host orchestration.
+//! - Supports command-driven search and export workflows without assuming external
+//!   platform UI frameworks.
+#![forbid(unsafe_code)]
 
 use pst_pst_pst_core::{CommandPayload, CoreError, CoreResult};
 
 /// UI module result alias shared across implementations.
+///
+/// Error surfaces are shared with core so callers can route UI and export/runtime
+/// failures uniformly without custom adapters.
 pub type UiResult<T> = CoreResult<T>;
 /// UI module error alias.
+///
+/// Errors are native, structured values from the shared core crate.
 pub type UiError = CoreError;
 
 /// Supported interaction modes.
@@ -34,9 +46,15 @@ pub enum UiOutput {
 /// Runtime configuration for terminal rendering.
 #[derive(Debug, Clone)]
 pub struct UiConfig {
+    /// Selected runtime interaction mode.
     pub mode: UiMode,
+    /// Selected output transport style.
     pub output: UiOutput,
+    /// Request deterministic output ordering.
+    ///
+    /// Use deterministic sessions for reproducible manifest/test expectations.
     pub deterministic: bool,
+    /// Max number of command entries to keep in-memory for session continuity.
     pub max_history: usize,
 }
 
@@ -54,25 +72,40 @@ impl Default for UiConfig {
 /// Normalized UI command model.
 #[derive(Debug, Clone)]
 pub struct UiCommand {
+    /// Raw source line parsed to produce this command.
     pub raw: String,
+    /// Normalized command kind.
     pub kind: UiCommandKind,
+    /// Parsed command arguments.
     pub args: Vec<String>,
 }
 
 /// Canonical command kinds supported by terminal UI.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum UiCommandKind {
+    /// Show usage/help.
     Help,
+    /// Show environment/session info.
     Info,
+    /// Enumerate folders for the active mailbox/session.
     Folders,
+    /// Enumerate messages for the active mailbox/session.
     Messages,
+    /// Execute a search query.
     Search,
+    /// Execute an export request.
     Extract,
+    /// Execute an export operation.
     Export,
+    /// Validate the active session/context.
     Validate,
+    /// Trigger/re-run index operations.
     Index,
+    /// Begin/refresh watch notifications.
     Watch,
+    /// Exit current UI runtime loop.
     Quit,
+    /// Parsed command fallback.
     Unknown(String),
 }
 
@@ -145,9 +178,13 @@ pub enum UiEvent {
 /// Runtime state for terminal UI.
 #[derive(Debug, Clone)]
 pub struct UiState {
+    /// UI config driving rendering and determinism choices.
     pub config: UiConfig,
+    /// Monotonic command id counter.
     pub command_counter: u64,
+    /// Retained command history for deterministic replay/debug.
     pub command_history: Vec<String>,
+    /// Last rendered status for a compact session snapshot.
     pub last_status: Option<String>,
 }
 
@@ -196,24 +233,36 @@ impl Default for UiState {
 /// Command output carrier to keep UI rendering independent from runtime logic.
 #[derive(Debug, Clone)]
 pub enum UiPayload {
+    /// Plain text output payload.
     Text(String),
+    /// Shared typed payload from shared core domain types.
     Core(CommandPayload),
 }
 
 /// Command execution result shape.
 #[derive(Debug, Clone)]
 pub struct UiCommandResult {
+    /// Command id echoed back for correlation.
     pub command_id: u64,
+    /// Request explicit terminal exit.
     pub exit: bool,
+    /// Optional completion status.
     pub status: Option<String>,
+    /// Optional user-facing payload.
     pub payload: Option<UiPayload>,
 }
 
 /// Hook point for concrete command implementations.
-pub trait UiCommandBus {
-    type Error;
+///
+/// Implementations should avoid FFI and platform-specific UI dependencies so the
+/// CLI and host runtime can remain native and deterministic.
+pub trait UiCommandBus: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Handle a parsed UI command.
+    ///
+    /// Implementations may be called from concurrent scheduling layers; all
+    /// mutations must therefore be internally synchronized by the host.
     fn execute(
         &mut self,
         state: &UiState,
@@ -222,7 +271,11 @@ pub trait UiCommandBus {
 }
 
 /// Hook point for rendering events.
-pub trait UiRenderer {
+pub trait UiRenderer: Send + Sync {
+    /// Render a single event using the given runtime snapshot.
+    ///
+    /// Implementations should be side-effect free to make concurrent replay
+    /// and logging pipelines deterministic.
     fn render_event(&self, event: &UiEvent, state: &UiState) -> String;
 }
 
@@ -261,6 +314,35 @@ impl TerminalRenderer {
                 CommandPayload::Validation(v) => format!(
                     "Validation passed={} warnings={} errors={}",
                     v.passed, v.warnings, v.errors
+                ),
+                CommandPayload::Index(v) => format!(
+                    "Index mailbox={} db={:?} docs={} segments={} deterministic={} policy={:?} mode={:?}",
+                    v.mailbox_id
+                        .as_ref()
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    v.db_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<memory>".to_string()),
+                    v.documents,
+                    v.segments,
+                    v.deterministic,
+                    v.policy,
+                    v.mode
+                ),
+                CommandPayload::Watch(v) => format!(
+                    "Watch dir={} matched={} processed={} failed={}",
+                    v.watched_dir.display(),
+                    v.matched_files,
+                    v.processed_events,
+                    v.failed
+                ),
+                CommandPayload::Ui(v) => format!(
+                    "Ui session={} bind={} started={}",
+                    v.session_id,
+                    v.bind,
+                    v.started
                 ),
             },
         }
@@ -351,6 +433,18 @@ impl UiRenderer for TerminalRenderer {
             },
             UiOutput::Jsonl | UiOutput::Ndjson => {
                 match event {
+                    UiEvent::Progress {
+                        command_id,
+                        stage,
+                        done,
+                        total,
+                    } => {
+                        let total = total.map_or_else(|| "null".to_string(), |value| value.to_string());
+                        format!(
+                            "{{\"command_id\":{command_id},\"type\":\"progress\",\"stage\":\"{}\",\"done\":{done},\"total\":{total}}}",
+                            stage.replace('"', "\\\"")
+                        )
+                    }
                     UiEvent::Output {
                         command_id,
                         payload,
@@ -368,7 +462,6 @@ impl UiRenderer for TerminalRenderer {
                             UiEvent::Completed { command_id, .. } => *command_id,
                             UiEvent::Failed { command_id, .. } => *command_id,
                             UiEvent::Exit { command_id, .. } => *command_id,
-                            _ => 0,
                         },
                         event_type_name(event)
                     ),
@@ -390,7 +483,10 @@ fn event_type_name(event: &UiEvent) -> &'static str {
 }
 
 /// Runtime container for terminal dispatch loop.
-pub trait UiRuntime {
+///
+/// Host-facing runtime contract remains thread-aware: stateful execution is confined
+/// to owned instances, while individual events and buses can be shared by design.
+pub trait UiRuntime: Send + Sync {
     fn state(&self) -> &UiState;
     fn state_mut(&mut self) -> &mut UiState;
 

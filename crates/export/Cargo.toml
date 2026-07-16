@@ -2,7 +2,7 @@
 name = "pst-pst-pst-export"
 version = "0.1.0"
 edition = "2021"
-description = "Placeholder export crate for future data export interfaces."
+description = "Deterministic export pipeline for mailbox and attachment artifacts."
 license = "MIT"
 rust-version = "1.70"
 

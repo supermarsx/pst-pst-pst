@@ -15,7 +15,7 @@
   - `crates/ui`
 - Evolved parser/index/export/ui placeholders into contract-first interfaces that depend on `core` domain contracts.
 - Synced user-facing docs:
-  - `README.md` command examples and configuration path to `pst-pst-pst`
+  - `readme.md` command examples and configuration path to `pst-pst-pst`
   - `spec.md`/`roadmap` naming and command references updated.
 
 ## Next checkpoints
@@ -24,3 +24,4 @@
 2. Add file-discovery/parsing trait adapters and deterministic output skeleton types.
 3. Add first end-to-end command path with mocked backends (`info`, `folders`, `validate`) to keep the loop executable.
 4. Add minimal CI configuration for no-FFI dependency enforcement.
+
