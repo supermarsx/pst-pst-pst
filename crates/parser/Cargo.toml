@@ -1,0 +1,12 @@
+[package]
+name = "pst-pst-pst-parser"
+version = "0.1.0"
+edition = "2021"
+description = "Placeholder parser module for future parser implementations."
+license = "MIT"
+rust-version = "1.70"
+
+[dependencies]
+pst-pst-pst-core = { path = "../core" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+thiserror = "1"

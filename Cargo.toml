@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+    "crates/common",
+    "crates/parser",
+    "crates/index",
+    "crates/export",
+    "crates/ui",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+rust-version = "1.70"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "warn"
+missing_docs = "warn"
+unused_imports = "warn"
+unused_lifetimes = "warn"
+unused_results = "warn"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

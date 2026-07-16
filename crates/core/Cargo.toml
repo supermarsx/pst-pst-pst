@@ -1,0 +1,17 @@
+[package]
+name = "pst-pst-pst-core"
+version = "0.1.0"
+edition = "2021"
+description = "Foundational domain primitives for the pst-pst-pst workspace."
+license = "MIT"
+rust-version = "1.70"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "1", features = ["derive"], optional = true }
+thiserror = "1"
+uuid = { version = "1", default-features = false, features = ["std", "v4"] }
+
+[features]
+default = []
+serde = ["dep:serde", "chrono/serde", "uuid/serde"]

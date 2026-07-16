@@ -1,0 +1,11 @@
+/target/
+/acli-*/target/
+/acli-*/.idea/
+/.idea/
+/.vscode/
+/.cargo/registry
+/.DS_Store
+/Thumbs.db
+
+# Keep lockfiles per-environment and optional by convention if preferred
+/Cargo.lock
